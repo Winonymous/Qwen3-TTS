@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import argparse
+import csv
 import json
 
 from qwen_tts import Qwen3TTSTokenizer
@@ -25,7 +26,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
-    parser.add_argument("--input_jsonl", type=str, required=True)
+    parser.add_argument("--input_tsv", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
     args = parser.parse_args()
 
@@ -34,8 +35,9 @@ def main():
         device_map=args.device,
     )
 
-    total_lines = open(args.input_jsonl).readlines()
-    total_lines = [json.loads(line.strip()) for line in total_lines]
+    # TSV with a header row, e.g. columns: audio, text, ref_audio
+    with open(args.input_tsv, newline='', encoding='utf-8') as f:
+        total_lines = list(csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE))
 
     final_lines = []
     batch_lines = []
@@ -63,7 +65,7 @@ def main():
 
     final_lines = [json.dumps(line, ensure_ascii=False) for line in final_lines]
 
-    with open(args.output_jsonl, 'w') as f:
+    with open(args.output_jsonl, 'w', encoding='utf-8') as f:
         for line in final_lines:
             f.writelines(line + '\n')
 
