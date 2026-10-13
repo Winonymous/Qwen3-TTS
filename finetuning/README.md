@@ -23,6 +23,13 @@ Example:
 {"audio":"./data/utt0002.wav","text":"She said she would be here by noon.","ref_audio":"./data/ref.wav"}
 ```
 
+Optional columns (also carried through `prepare_data.py`):
+
+- `speaker`: speaker name for this row (falls back to `--speaker_name`). Several speakers can be trained in one run; each gets its own id in the codec embedding table, and its embedding is the mean speaker-encoder embedding of its `ref_audio`s. Names are lowercased.
+- `language`: language name (default `Auto`). Languages the checkpoint does not know (e.g. `yoruba`) are registered automatically: they get a new language id, an embedding initialised from the mean of the existing language embeddings plus noise, and are trained. Names must not contain `dialect`.
+
+The saved `config.json` merges the new `spk_id` / `codec_language_id` with the existing ones, so at inference use `generate_custom_voice(text, speaker="<name>", language="<name>")`.
+
 `ref_audio` recommendation:
 - Strongly recommended: use the same `ref_audio` for all samples.
 - Keeping `ref_audio` identical across the dataset usually improves speaker consistency and stability during generation.

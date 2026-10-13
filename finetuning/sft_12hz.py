@@ -27,10 +27,63 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
-target_speaker_embedding = None
-def train():
-    global target_speaker_embedding
+LANGUAGE_ID_RANGE = (2048, 2148)  # free slots among the codec special tokens (suppressed at generation)
+SPEAKER_ID_START = 3000
 
+
+def _used_codec_ids(talker_config):
+    used = set()
+    for k, v in talker_config.to_dict().items():
+        if isinstance(v, int) and k.endswith("_id"):
+            used.add(v)
+    for name in ("spk_id", "codec_language_id"):
+        used.update(v for v in (getattr(talker_config, name, None) or {}).values() if isinstance(v, int))
+    return used
+
+
+def register_speakers_and_languages(talker_config, speakers, languages):
+    """Assign codec-embedding ids to speakers / languages that the checkpoint does not know yet.
+
+    Names already in the config keep their id (so an existing speaker/language is simply fine-tuned further).
+    Returns (new_speaker_ids, new_language_ids) as {name: id}.
+    """
+    if talker_config.codec_language_id is None:
+        talker_config.codec_language_id = {}
+    if talker_config.spk_id is None:
+        talker_config.spk_id = {}
+    if talker_config.spk_is_dialect is None:
+        talker_config.spk_is_dialect = {}
+    used = _used_codec_ids(talker_config)
+
+    def alloc(candidates):
+        for i in candidates:
+            if i not in used:
+                used.add(i)
+                return i
+        raise RuntimeError("Out of free codec embedding ids; enlarge talker_config.vocab_size to add more.")
+
+    new_languages = {}
+    for lang in languages:
+        if lang == "auto" or lang in talker_config.codec_language_id:
+            continue
+        if "dialect" in lang:
+            raise ValueError(f"Language name {lang!r} must not contain 'dialect' (reserved by get_supported_languages).")
+        lang_id = alloc(list(range(*LANGUAGE_ID_RANGE)) + list(range(SPEAKER_ID_START)))
+        talker_config.codec_language_id[lang] = lang_id
+        new_languages[lang] = lang_id
+
+    new_speakers = {}
+    for spk in speakers:
+        if spk in talker_config.spk_id:
+            continue
+        spk_id = alloc(range(SPEAKER_ID_START, talker_config.vocab_size))
+        talker_config.spk_id[spk] = spk_id
+        talker_config.spk_is_dialect[spk] = False
+        new_speakers[spk] = spk_id
+    return new_speakers, new_languages
+
+
+def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--output_model_path", type=str, default="output")
@@ -38,7 +91,8 @@ def train():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--speaker_name", type=str, default="speaker_test",
+                        help="Speaker used for rows without a `speaker` field.")
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
@@ -52,9 +106,31 @@ def train():
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
-    train_data = open(args.train_jsonl).readlines()
+    train_data = open(args.train_jsonl, encoding="utf-8").readlines()
     train_data = [json.loads(line) for line in train_data]
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+
+    # Speakers / languages come from the `speaker` / `language` fields of each row.
+    speakers = sorted({(d.get("speaker") or args.speaker_name).lower() for d in train_data})
+    languages = sorted({(d.get("language") or "auto").lower() for d in train_data})
+    talker_config = config.talker_config
+    new_speakers, new_languages = register_speakers_and_languages(talker_config, speakers, languages)
+    accelerator.print(f"Speakers: {speakers} (new: {new_speakers})")
+    accelerator.print(f"Languages: {languages} (new: {new_languages})")
+
+    # New language embeddings start from the mean of the known ones plus noise at the same scale,
+    # so they begin inside the existing language-embedding distribution and are then trained.
+    codec_weight = qwen3tts.model.talker.model.codec_embedding.weight
+    with torch.no_grad():
+        known = [i for name, i in talker_config.codec_language_id.items() if name not in new_languages]
+        if known:
+            known_rows = codec_weight[known].float()
+            mean, std = known_rows.mean(0), known_rows.std()
+        else:
+            mean, std = torch.zeros_like(codec_weight[0]).float(), codec_weight.float().std()
+        for lang_id in new_languages.values():
+            codec_weight[lang_id] = (mean + torch.randn_like(mean) * std).to(codec_weight.dtype)
+
+    dataset = TTSDataset(train_data, qwen3tts.processor, config, default_speaker=args.speaker_name)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -64,6 +140,7 @@ def train():
     )
 
     num_epochs = args.num_epochs
+    speaker_sum, speaker_count = {}, {}
     model.train()
 
     for epoch in range(num_epochs):
@@ -79,16 +156,25 @@ def train():
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
 
+                speaker_pos = batch['speaker_pos']
+                speaker_idx = batch['speaker_idx']
+
                 speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
-                if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding
+
+                # Running mean of each speaker's encoder embedding; written into that speaker's codec row at save time.
+                all_emb = accelerator.gather(speaker_embedding).float()
+                all_idx = accelerator.gather(speaker_idx)
+                for emb, idx in zip(all_emb, all_idx.tolist()):
+                    name = dataset.speakers[idx]
+                    speaker_sum[name] = speaker_sum.get(name, 0) + emb
+                    speaker_count[name] = speaker_count.get(name, 0) + 1
 
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
                 input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+                input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -132,14 +218,12 @@ def train():
             with open(input_config_file, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
             config_dict["tts_model_type"] = "custom_voice"
-            talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {
-                args.speaker_name: 3000
+            config_dict["talker_config"] = {
+                **config_dict.get("talker_config", {}),
+                "spk_id": dict(talker_config.spk_id),
+                "spk_is_dialect": dict(talker_config.spk_is_dialect),
+                "codec_language_id": dict(talker_config.codec_language_id),
             }
-            talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
-            }
-            config_dict["talker_config"] = talker_config
 
             with open(output_config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
@@ -153,7 +237,9 @@ def train():
                 del state_dict[k]
 
             weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+            for name, total in speaker_sum.items():
+                mean_embedding = total / speaker_count[name]
+                weight[talker_config.spk_id[name]] = mean_embedding.detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
 
