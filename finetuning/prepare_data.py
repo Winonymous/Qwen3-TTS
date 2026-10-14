@@ -28,6 +28,13 @@ def main():
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--input_tsv", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
+    parser.add_argument("--audio_column", type=str, default="audio",
+                        help="TSV column holding the path to each utterance's audio")
+    parser.add_argument("--text_column", type=str, default="text",
+                        help="TSV column holding the transcript")
+    parser.add_argument("--ref_path", type=str, default=None,
+                        help="Reference speaker audio used for every row. "
+                             "If omitted, a `ref_audio` column in the TSV is used.")
     args = parser.parse_args()
 
     tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
@@ -35,9 +42,25 @@ def main():
         device_map=args.device,
     )
 
-    # TSV with a header row, e.g. columns: audio, text, ref_audio
+    # TSV with a header row. Rows are normalized to the keys the training code
+    # expects (audio, text, ref_audio); any other columns (speaker, language, ...) pass through.
     with open(args.input_tsv, newline='', encoding='utf-8') as f:
-        total_lines = list(csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE))
+        reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
+        columns = reader.fieldnames or []
+        for col in (args.audio_column, args.text_column):
+            if col not in columns:
+                parser.error(f"column '{col}' not found in {args.input_tsv} (columns: {columns})")
+        if args.ref_path is None and 'ref_audio' not in columns:
+            parser.error("no --ref_path given and the TSV has no 'ref_audio' column")
+
+        total_lines = []
+        for row in reader:
+            item = {k: v for k, v in row.items() if k not in (args.audio_column, args.text_column)}
+            item['audio'] = row[args.audio_column]
+            item['text'] = row[args.text_column]
+            if args.ref_path is not None:
+                item['ref_audio'] = args.ref_path
+            total_lines.append(item)
 
     final_lines = []
     batch_lines = []

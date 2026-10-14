@@ -15,6 +15,9 @@ INIT_MODEL_PATH="${INIT_MODEL_PATH:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}"
 
 # TSV with header: audio, text, ref_audio  [, speaker, language]
 RAW_TSV="${RAW_TSV:-train_raw.tsv}"
+AUDIO_COLUMN="${AUDIO_COLUMN:-audio}"
+TEXT_COLUMN="${TEXT_COLUMN:-text}"
+REF_PATH="${REF_PATH:-}"               # optional: one reference audio for every row
 TRAIN_JSONL="${TRAIN_JSONL:-train_with_codes.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
 
@@ -34,10 +37,17 @@ fi
 
 # ---- 1) extract audio codes (single GPU is enough) ----
 if [ "${SKIP_PREPARE}" != "1" ]; then
+  REF_ARGS=()
+  if [ -n "${REF_PATH}" ]; then
+    REF_ARGS=(--ref_path "${REF_PATH}")
+  fi
   python prepare_data.py \
     --device cuda:0 \
     --tokenizer_model_path "${TOKENIZER_MODEL_PATH}" \
     --input_tsv "${RAW_TSV}" \
+    --audio_column "${AUDIO_COLUMN}" \
+    --text_column "${TEXT_COLUMN}" \
+    ${REF_ARGS[@]+"${REF_ARGS[@]}"} \
     --output_jsonl "${TRAIN_JSONL}"
 fi
 

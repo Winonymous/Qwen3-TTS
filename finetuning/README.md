@@ -37,13 +37,16 @@ The saved `config.json` merges the new `spk_id` / `codec_language_id` with the e
 
 ### 2) Prepare data (extract `audio_codes`)
 
-Convert `train_raw.jsonl` into a training JSONL that includes `audio_codes`:
+`prepare_data.py` reads a TSV with a header row and writes a training JSONL that includes `audio_codes`. Use `--audio_column` / `--text_column` to name the TSV columns (defaults: `audio`, `text`) and `--ref_path` to use one reference audio for every row (otherwise a `ref_audio` column is required). Other columns such as `speaker` and `language` are carried through.
 
 ```bash
 python prepare_data.py \
   --device cuda:0 \
   --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
-  --input_jsonl train_raw.jsonl \
+  --input_tsv train_raw.tsv \
+  --audio_column path \
+  --text_column sentence \
+  --ref_path ./data/ref.wav \
   --output_jsonl train_with_codes.jsonl
 ```
 
@@ -102,7 +105,7 @@ DEVICE="cuda:0"
 TOKENIZER_MODEL_PATH="Qwen/Qwen3-TTS-Tokenizer-12Hz"
 INIT_MODEL_PATH="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
-RAW_JSONL="train_raw.jsonl"
+RAW_TSV="train_raw.tsv"
 TRAIN_JSONL="train_with_codes.jsonl"
 OUTPUT_DIR="output"
 
@@ -114,7 +117,7 @@ SPEAKER_NAME="speaker_1"
 python prepare_data.py \
   --device ${DEVICE} \
   --tokenizer_model_path ${TOKENIZER_MODEL_PATH} \
-  --input_jsonl ${RAW_JSONL} \
+  --input_tsv ${RAW_TSV} \
   --output_jsonl ${TRAIN_JSONL}
 
 python sft_12hz.py \
