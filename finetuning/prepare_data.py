@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--input_tsv", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
+    parser.add_argument("--batch_size", type=int, default=BATCH_INFER_NUM,
+                        help="Audios encoded per forward pass; lower it if you run out of GPU memory")
     parser.add_argument("--audio_column", type=str, default="audio",
                         help="TSV column holding the path to each utterance's audio")
     parser.add_argument("--text_column", type=str, default="text",
@@ -85,7 +87,7 @@ def main():
         batch_lines.append(line)
         batch_audios.append(line['audio'])
 
-        if len(batch_lines) >= BATCH_INFER_NUM:
+        if len(batch_lines) >= args.batch_size:
             enc_res = tokenizer_12hz.encode(batch_audios)
             for code, line in zip(enc_res.audio_codes, batch_lines):
                 line['audio_codes'] = code.cpu().tolist()
