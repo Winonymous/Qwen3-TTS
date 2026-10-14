@@ -35,6 +35,17 @@ def main():
     parser.add_argument("--ref_path", type=str, default=None,
                         help="Reference speaker audio used for every row. "
                              "If omitted, a `ref_audio` column in the TSV is used.")
+    parser.add_argument("--speaker_column", type=str, default=None,
+                        help="TSV column holding the speaker name for each row")
+    parser.add_argument("--speaker", type=str, default=None,
+                        help="Speaker name for every row (or only for rows with an empty "
+                             "--speaker_column cell). If neither is set, training falls back "
+                             "to its own --speaker_name.")
+    parser.add_argument("--language_column", type=str, default=None,
+                        help="TSV column holding the language name for each row")
+    parser.add_argument("--language", type=str, default=None,
+                        help="Language name for every row (or only for rows with an empty "
+                             "--language_column cell). If neither is set, training uses `Auto`.")
     args = parser.parse_args()
 
     tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
@@ -42,24 +53,28 @@ def main():
         device_map=args.device,
     )
 
-    # TSV with a header row. Rows are normalized to the keys the training code
-    # expects (audio, text, ref_audio); any other columns (speaker, language, ...) pass through.
+    # TSV with a header row. Each row is rebuilt with the keys the training code
+    # expects (audio, text, ref_audio, and optionally speaker, language); other columns are dropped.
     with open(args.input_tsv, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t', quoting=csv.QUOTE_NONE)
         columns = reader.fieldnames or []
-        for col in (args.audio_column, args.text_column):
-            if col not in columns:
+        for col in (args.audio_column, args.text_column, args.speaker_column, args.language_column):
+            if col is not None and col not in columns:
                 parser.error(f"column '{col}' not found in {args.input_tsv} (columns: {columns})")
         if args.ref_path is None and 'ref_audio' not in columns:
             parser.error("no --ref_path given and the TSV has no 'ref_audio' column")
 
         total_lines = []
         for row in reader:
-            item = {k: v for k, v in row.items() if k not in (args.audio_column, args.text_column)}
-            item['audio'] = row[args.audio_column]
-            item['text'] = row[args.text_column]
-            if args.ref_path is not None:
-                item['ref_audio'] = args.ref_path
+            item = {'audio': row[args.audio_column], 'text': row[args.text_column]}
+            item['ref_audio'] = args.ref_path if args.ref_path is not None else row['ref_audio']
+            # per-row column value wins; the global value fills in when there is no column or the cell is empty
+            speaker = (row[args.speaker_column].strip() if args.speaker_column else '') or args.speaker
+            language = (row[args.language_column].strip() if args.language_column else '') or args.language
+            if speaker:
+                item['speaker'] = speaker
+            if language:
+                item['language'] = language
             total_lines.append(item)
 
     final_lines = []

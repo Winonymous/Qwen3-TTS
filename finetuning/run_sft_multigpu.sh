@@ -18,6 +18,10 @@ RAW_TSV="${RAW_TSV:-train_raw.tsv}"
 AUDIO_COLUMN="${AUDIO_COLUMN:-audio}"
 TEXT_COLUMN="${TEXT_COLUMN:-text}"
 REF_PATH="${REF_PATH:-}"               # optional: one reference audio for every row
+SPEAKER_COLUMN="${SPEAKER_COLUMN:-}"   # optional: per-row speaker column
+SPEAKER="${SPEAKER:-}"                 # optional: global speaker (also fills empty cells)
+LANGUAGE_COLUMN="${LANGUAGE_COLUMN:-}" # optional: per-row language column
+LANGUAGE="${LANGUAGE:-}"               # optional: global language (also fills empty cells)
 TRAIN_JSONL="${TRAIN_JSONL:-train_with_codes.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-output}"
 
@@ -41,6 +45,10 @@ if [ "${SKIP_PREPARE}" != "1" ]; then
   if [ -n "${REF_PATH}" ]; then
     REF_ARGS=(--ref_path "${REF_PATH}")
   fi
+  if [ -n "${SPEAKER_COLUMN}" ]; then REF_ARGS+=(--speaker_column "${SPEAKER_COLUMN}"); fi
+  if [ -n "${SPEAKER}" ]; then REF_ARGS+=(--speaker "${SPEAKER}"); fi
+  if [ -n "${LANGUAGE_COLUMN}" ]; then REF_ARGS+=(--language_column "${LANGUAGE_COLUMN}"); fi
+  if [ -n "${LANGUAGE}" ]; then REF_ARGS+=(--language "${LANGUAGE}"); fi
   python prepare_data.py \
     --device cuda:0 \
     --tokenizer_model_path "${TOKENIZER_MODEL_PATH}" \

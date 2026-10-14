@@ -37,15 +37,17 @@ The saved `config.json` merges the new `spk_id` / `codec_language_id` with the e
 
 ### 2) Prepare data (extract `audio_codes`)
 
-`prepare_data.py` reads a TSV with a header row and writes a training JSONL that includes `audio_codes`. Use `--audio_column` / `--text_column` to name the TSV columns (defaults: `audio`, `text`) and `--ref_path` to use one reference audio for every row (otherwise a `ref_audio` column is required). Other columns such as `speaker` and `language` are carried through.
+`prepare_data.py` reads a TSV with a header row and writes a training JSONL that includes `audio_codes`. Use `--audio_column` / `--text_column` to name the TSV columns (defaults: `audio`, `text`) and `--ref_path` to use one reference audio for every row (otherwise a `ref_audio` column is required). Speaker and language can be set per row with `--speaker_column` / `--language_column`, globally with `--speaker` / `--language`, or both (the column value wins; the global value fills empty cells). Columns not mapped by an argument are dropped from the output.
 
 ```bash
 python prepare_data.py \
   --device cuda:0 \
   --tokenizer_model_path Qwen/Qwen3-TTS-Tokenizer-12Hz \
   --input_tsv train_raw.tsv \
-  --audio_column path \
+  --audio_column full_path \
   --text_column sentence \
+  --speaker_column voice_over \
+  --language_column language \
   --ref_path ./data/ref.wav \
   --output_jsonl train_with_codes.jsonl
 ```
