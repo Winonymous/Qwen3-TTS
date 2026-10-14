@@ -247,7 +247,10 @@ class TTSDataset(Dataset):
             attention_mask[i, :H+text_ids_len+codec_ids_len] = True
         
         ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        # Reference clips differ in length across speakers. Crop to the shortest one in the batch
+        # instead of padding, so padding frames don't skew the speaker embedding.
+        min_frames = min(m.shape[1] for m in ref_mels)
+        ref_mels = torch.cat([m[:, :min_frames] for m in ref_mels], dim=0)
 
         return {
             'input_ids':input_ids,
