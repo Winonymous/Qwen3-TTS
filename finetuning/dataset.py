@@ -49,7 +49,8 @@ class TTSDataset(Dataset):
     
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
         
-        audio, sr = librosa.load(x, sr=None, mono=True)
+        # resample to 24 kHz on load; the mel extractor only supports 24 kHz
+        audio, sr = librosa.load(x, sr=24000, mono=True)
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
