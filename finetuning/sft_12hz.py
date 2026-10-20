@@ -19,11 +19,12 @@ import os
 import shutil
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from dataset import TTSDataset
 from huggingface_hub import snapshot_download
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
+from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
@@ -84,6 +85,54 @@ def register_speakers_and_languages(talker_config, speakers, languages):
     return new_speakers, new_languages
 
 
+class TrainStep(nn.Module):
+    """Runs the whole training forward and returns the loss.
+
+    DDP only synchronises gradients for calls that go through the wrapper's own `forward`, so the loss
+    computation has to live here instead of calling `model.talker(...)` on the wrapped model from outside.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, codec_ids, ref_mels, text_embedding_mask, codec_embedding_mask,
+                attention_mask, codec_0_labels, codec_mask, speaker_pos):
+        model = self.model
+
+        with torch.no_grad():
+            speaker_embedding = model.speaker_encoder(ref_mels.to(model.dtype))
+
+        input_text_ids = input_ids[:, :, 0]
+        input_codec_ids = input_ids[:, :, 1]
+
+        input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+        input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+        input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = speaker_embedding
+
+        input_embeddings = input_text_embedding + input_codec_embedding
+
+        for i in range(1, 16):
+            codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+            codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+            input_embeddings = input_embeddings + codec_i_embedding
+
+        outputs = model.talker(
+            inputs_embeds=input_embeddings[:, :-1, :],
+            attention_mask=attention_mask[:, :-1],
+            labels=codec_0_labels[:, 1:],
+            output_hidden_states=True
+        )
+
+        hidden_states = outputs.hidden_states[0][-1]
+        talker_hidden_states = hidden_states[codec_mask[:, :-1]]
+        talker_codec_ids = codec_ids[codec_mask]
+
+        _, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+
+        return outputs.loss + 0.3 * sub_talker_loss, speaker_embedding
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
@@ -96,7 +145,11 @@ def train():
                         help="Speaker used for rows without a `speaker` field.")
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=4,
+        mixed_precision="bf16",
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
 
     MODEL_PATH = args.init_model_path
     if not os.path.isdir(MODEL_PATH):
@@ -138,10 +191,14 @@ def train():
     dataset = TTSDataset(train_data, qwen3tts.processor, config, default_speaker=args.speaker_name)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    # The speaker encoder is only used to produce (detached) conditioning embeddings, never trained.
+    qwen3tts.model.speaker_encoder.requires_grad_(False)
+
+    train_step = TrainStep(qwen3tts.model)
+    optimizer = AdamW([p for p in train_step.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.01)
 
     model, optimizer, train_dataloader = accelerator.prepare(
-        qwen3tts.model, optimizer, train_dataloader
+        train_step, optimizer, train_dataloader
     )
 
     num_epochs = args.num_epochs
@@ -152,56 +209,20 @@ def train():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
-                input_ids = batch['input_ids']
-                codec_ids = batch['codec_ids']
-                ref_mels = batch['ref_mels']
-                text_embedding_mask = batch['text_embedding_mask']
-                codec_embedding_mask = batch['codec_embedding_mask']
-                attention_mask = batch['attention_mask']
-                codec_0_labels = batch['codec_0_labels']
-                codec_mask = batch['codec_mask']
-
-                speaker_pos = batch['speaker_pos']
-                speaker_idx = batch['speaker_idx']
-
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                loss, speaker_embedding = model(
+                    batch['input_ids'], batch['codec_ids'], batch['ref_mels'],
+                    batch['text_embedding_mask'], batch['codec_embedding_mask'],
+                    batch['attention_mask'], batch['codec_0_labels'], batch['codec_mask'],
+                    batch['speaker_pos'],
+                )
 
                 # Running mean of each speaker's encoder embedding; written into that speaker's codec row at save time.
-                all_emb = accelerator.gather(speaker_embedding).float()
-                all_idx = accelerator.gather(speaker_idx)
+                all_emb = accelerator.gather(speaker_embedding.detach()).float()
+                all_idx = accelerator.gather(batch['speaker_idx'])
                 for emb, idx in zip(all_emb, all_idx.tolist()):
                     name = dataset.speakers[idx]
                     speaker_sum[name] = speaker_sum.get(name, 0) + emb
                     speaker_count[name] = speaker_count.get(name, 0) + 1
-
-                input_text_ids = input_ids[:, :, 0]
-                input_codec_ids = input_ids[:, :, 1]
-
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = speaker_embedding
-
-                input_embeddings = input_text_embedding + input_codec_embedding
-
-                for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-                    input_embeddings = input_embeddings + codec_i_embedding
-
-                outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True
-                )
-
-                hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
-                talker_codec_ids = codec_ids[codec_mask]
-
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
-
-                loss = outputs.loss + 0.3 * sub_talker_loss
 
                 accelerator.backward(loss)
 
@@ -233,8 +254,8 @@ def train():
             with open(output_config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-            unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+            # `qwen3tts.model` is the same module the wrapper trains, so its weights are the trained ones
+            state_dict = {k: v.detach().to("cpu") for k, v in qwen3tts.model.state_dict().items()}
 
             drop_prefix = "speaker_encoder"
             keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
