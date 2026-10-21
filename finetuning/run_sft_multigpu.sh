@@ -15,6 +15,12 @@ INIT_MODEL_PATH="${INIT_MODEL_PATH:-Qwen/Qwen3-TTS-12Hz-1.7B-Base}"
 
 # TSV with header: audio, text, ref_audio  [, speaker, language]
 RAW_TSV="${RAW_TSV:-train_raw.tsv}"
+# Alternatively read a Hugging Face dataset (Hub id or local path); then the *_COLUMN vars name its columns
+# and RAW_TSV is ignored. Private datasets: `huggingface-cli login` or export HF_TOKEN first.
+HF_DATASET="${HF_DATASET:-}"
+HF_CONFIG="${HF_CONFIG:-}"
+HF_SPLIT="${HF_SPLIT:-train}"
+MAX_SAMPLES="${MAX_SAMPLES:-}"         # optional: only the first N rows (quick test)
 AUDIO_COLUMN="${AUDIO_COLUMN:-audio}"
 TEXT_COLUMN="${TEXT_COLUMN:-text}"
 REF_PATH="${REF_PATH:-}"               # optional: one reference audio for every row

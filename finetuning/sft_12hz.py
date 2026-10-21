@@ -106,7 +106,11 @@ class TrainStep(nn.Module):
         input_text_ids = input_ids[:, :, 0]
         input_codec_ids = input_ids[:, :, 1]
 
-        input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+        # Inference always runs text embeddings through `text_projection` (a text_hidden -> hidden MLP), so
+        # training has to as well; the mask goes after it because the projection has a bias.
+        input_text_embedding = model.talker.text_projection(
+            model.talker.model.text_embedding(input_text_ids)
+        ) * text_embedding_mask
         input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
         input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = speaker_embedding
 

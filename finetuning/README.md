@@ -35,6 +35,16 @@ The saved `config.json` merges the new `spk_id` / `codec_language_id` with the e
 - Keeping `ref_audio` identical across the dataset usually improves speaker consistency and stability during generation.
 
 
+### 1b) Or use a Hugging Face dataset
+
+Instead of a TSV, `prepare_data.py` can read a Hub dataset (or a local `load_dataset` path). The `--audio_column`, `--text_column`, `--speaker_column` and `--language_column` options then name dataset columns (`audio` must be an `Audio` feature; `ClassLabel` columns are converted to their names). Audio is decoded, resampled to 24 kHz mono and written as wav files to `--audio_out_dir` (default: `hf_audio/` next to the output JSONL), since training reads audio from file paths. Already-written files are reused on re-runs.
+
+```bash
+python prepare_data.py   --hf_dataset your-org/your-dataset --hf_split train   --audio_column audio --text_column sentence   --speaker_column speaker_id --language yoruba   --output_jsonl train_with_codes.jsonl
+```
+
+If you don't pass `--ref_path`, each speaker's first utterance is used as its reference audio (pick a clean one with `--ref_path` if that matters). Use `--max_samples 100` for a quick test; for private datasets run `huggingface-cli login` first. `run_sft_multigpu.sh` accepts the same through `HF_DATASET`, `HF_CONFIG`, `HF_SPLIT` and `MAX_SAMPLES`.
+
 ### 2) Prepare data (extract `audio_codes`)
 
 `prepare_data.py` reads a TSV with a header row and writes a training JSONL that includes `audio_codes`. Use `--audio_column` / `--text_column` to name the TSV columns (defaults: `audio`, `text`) and `--ref_path` to use one reference audio for every row (otherwise a `ref_audio` column is required). Speaker and language can be set per row with `--speaker_column` / `--language_column`, globally with `--speaker` / `--language`, or both (the column value wins; the global value fills empty cells). Columns not mapped by an argument are dropped from the output.
