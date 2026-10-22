@@ -203,8 +203,11 @@ class TTSDataset(Dataset):
             codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
         
+        # Each ref_mel is (1, time, mel_bins); different reference clips have different lengths, so crop
+        # every mel to the shortest one in the batch before stacking.
         ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        min_len = min(m.shape[1] for m in ref_mels)
+        ref_mels = torch.cat([m[:, :min_len] for m in ref_mels], dim=0)
 
         return {
             'input_ids':input_ids,
