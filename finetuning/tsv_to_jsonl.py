@@ -48,6 +48,9 @@ def main():
     parser.add_argument("--ref_path", type=str, default=None,
                         help="One reference audio used for every row (recommended: same ref for all rows). "
                              "If it is omitted and a row has no ref_audio, the median-length audio is used.")
+    parser.add_argument("--language", type=str, default=None,
+                        help="Language for every row, e.g. English (default: none = Auto). Must be a language the "
+                             "base model knows. Use the same value as `language=` at inference.")
     parser.add_argument("--check_audio", action="store_true",
                         help="Skip rows whose audio file does not exist")
     args = parser.parse_args()
@@ -68,7 +71,10 @@ def main():
             if not audio or not text or (args.check_audio and not os.path.isfile(audio)):
                 skipped += 1
                 continue
-            rows.append({"audio": audio, "text": text, "ref_audio": ref_audio})
+            item = {"audio": audio, "text": text, "ref_audio": ref_audio}
+            if args.language:
+                item["language"] = args.language
+            rows.append(item)
 
     # Rows without a reference share the median-length clip of the dataset.
     if any(not r["ref_audio"] for r in rows):

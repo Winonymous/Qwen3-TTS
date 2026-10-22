@@ -99,7 +99,10 @@ def train():
                     model.talker.model.text_embedding(input_text_ids)
                 ) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+                # the speaker slot sits right before the final codec_pad of the header; its index depends on whether
+                # the sample has a language token
+                speaker_pos = batch['speaker_pos'].to(input_ids.device)
+                input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -145,10 +148,10 @@ def train():
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
             talker_config["spk_id"] = {
-                args.speaker_name: 3000
+                args.speaker_name.lower(): 3000
             }
             talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
+                args.speaker_name.lower(): False
             }
             config_dict["talker_config"] = talker_config
 
