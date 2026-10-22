@@ -18,6 +18,8 @@ import argparse
 import hashlib
 import json
 import os
+import random
+from collections import defaultdict
 
 import librosa
 import soundfile as sf
@@ -48,6 +50,30 @@ def resample_ref_audio(path, out_dir, cache):
     return out_path
 
 
+def split_rows(rows, test_ratio, seed):
+    """Split rows into (train, test), keeping the original order inside each split.
+
+    Rows are grouped by (speaker, language), and each group is split separately so that every speaker and
+    language is represented in the test set. A group with a single row stays in train.
+    """
+    groups = defaultdict(list)
+    for idx, row in enumerate(rows):
+        groups[(row.get('speaker'), row.get('language'))].append(idx)
+
+    rng = random.Random(seed)
+    test_idx = set()
+    for key in sorted(groups, key=str):
+        idxs = groups[key]
+        if len(idxs) < 2:
+            continue
+        n_test = min(max(1, round(len(idxs) * test_ratio)), len(idxs) - 1)
+        test_idx.update(rng.sample(idxs, n_test))
+
+    train = [r for i, r in enumerate(rows) if i not in test_idx]
+    test = [r for i, r in enumerate(rows) if i in test_idx]
+    return train, test
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -57,7 +83,18 @@ def main():
     parser.add_argument("--resampled_dir", type=str, default=None,
                         help="Where 24 kHz copies of reference audio are written "
                              "(default: <output_jsonl dir>/ref_24k)")
+    parser.add_argument("--test_ratio", type=float, default=0.05,
+                        help="Fraction of rows held out as a test (validation) set; 0 writes everything to "
+                             "--output_jsonl. Rows are split per (speaker, language) group.")
+    parser.add_argument("--test_jsonl", type=str, default=None,
+                        help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
     args = parser.parse_args()
+    if not 0.0 <= args.test_ratio < 1.0:
+        parser.error("--test_ratio must be in [0, 1)")
+    if args.test_jsonl is None:
+        stem, ext = os.path.splitext(args.output_jsonl)
+        args.test_jsonl = f"{stem}_test{ext or '.jsonl'}"
     if args.resampled_dir is None:
         args.resampled_dir = os.path.join(os.path.dirname(os.path.abspath(args.output_jsonl)), "ref_24k")
 
@@ -80,35 +117,45 @@ def main():
     changed = sum(1 for k, v in ref_cache.items() if k != v)
     print(f"Reference audio: {len(ref_cache)} unique file(s), {changed} resampled to 24 kHz mono")
 
-    final_lines =    []
-    batch_lines = []
-    batch_audios = []
-    for line in total_lines:
+    def encode_rows(rows):
+        encoded = []
+        batch_lines = []
+        batch_audios = []
+        for line in rows:
+            batch_lines.append(line)
+            batch_audios.append(line['audio'])
 
-        batch_lines.append(line)
-        batch_audios.append(line['audio'])
+            if len(batch_lines) >= BATCH_INFER_NUM:
+                enc_res = tokenizer_12hz.encode(batch_audios)
+                for code, line in zip(enc_res.audio_codes, batch_lines):
+                    line['audio_codes'] = code.cpu().tolist()
+                    encoded.append(line)
+                batch_lines.clear()
+                batch_audios.clear()
 
-        if len(batch_lines) >= BATCH_INFER_NUM:
+        if len(batch_audios) > 0:
             enc_res = tokenizer_12hz.encode(batch_audios)
             for code, line in zip(enc_res.audio_codes, batch_lines):
                 line['audio_codes'] = code.cpu().tolist()
-                final_lines.append(line)
-            batch_lines.clear()
-            batch_audios.clear()
+                encoded.append(line)
+        return encoded
 
-    if len(batch_audios) > 0:
-        enc_res = tokenizer_12hz.encode(batch_audios)
-        for code, line in zip(enc_res.audio_codes, batch_lines):
-            line['audio_codes'] = code.cpu().tolist()
-            final_lines.append(line)
-        batch_lines.clear()
-        batch_audios.clear()
+    def write_jsonl(rows, path):
+        with open(path, 'w') as f:
+            for line in rows:
+                f.writelines(json.dumps(line, ensure_ascii=False) + '\n')
 
-    final_lines = [json.dumps(line, ensure_ascii=False) for line in final_lines]
+    if args.test_ratio > 0:
+        train_rows, test_rows = split_rows(total_lines, args.test_ratio, args.seed)
+    else:
+        train_rows, test_rows = total_lines, []
+    print(f"Split: {len(train_rows)} train rows, {len(test_rows)} test rows")
 
-    with open(args.output_jsonl, 'w') as f:
-        for line in final_lines:
-            f.writelines(line + '\n')
+    write_jsonl(encode_rows(train_rows), args.output_jsonl)
+    print(f"Wrote {args.output_jsonl}")
+    if test_rows:
+        write_jsonl(encode_rows(test_rows), args.test_jsonl)
+        print(f"Wrote {args.test_jsonl}")
 
 if __name__ == "__main__":
     main()
