@@ -21,6 +21,7 @@ import shutil
 import torch
 from accelerate import Accelerator
 from dataset import TTSDataset
+from huggingface_hub import snapshot_download
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
@@ -44,6 +45,10 @@ def train():
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
 
     MODEL_PATH = args.init_model_path
+    if not os.path.isdir(MODEL_PATH):
+        # A Hub repo id: resolve it to the local snapshot dir (uses the HF cache / offline mode), since
+        # checkpoints are built by copying this directory and reading its config.json.
+        MODEL_PATH = snapshot_download(MODEL_PATH)
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
