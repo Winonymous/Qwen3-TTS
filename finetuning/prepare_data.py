@@ -50,6 +50,19 @@ def resample_ref_audio(path, out_dir, cache):
     return out_path
 
 
+def audio_is_readable(path):
+    """True if the file can be opened and has samples (checked with soundfile, then librosa for other formats)."""
+    try:
+        return sf.info(path).frames > 0
+    except Exception:
+        pass
+    try:
+        y, _ = librosa.load(path, sr=None, mono=True, duration=0.5)
+        return len(y) > 0
+    except Exception:
+        return False
+
+
 def split_rows(rows, test_ratio, seed):
     """Split rows into (train, test), keeping the original order inside each split.
 
@@ -106,6 +119,17 @@ def main():
     total_lines = open(args.input_jsonl).readlines()
     total_lines = [json.loads(line.strip()) for line in total_lines]
 
+    # Drop rows whose audio cannot be read: one corrupt file would otherwise abort the whole encoding run.
+    readable = [audio_is_readable(line['audio']) for line in total_lines]
+    bad_audio = [line['audio'] for line, ok in zip(total_lines, readable) if not ok]
+    if bad_audio:
+        bad_path = args.output_jsonl + ".bad_audio.txt"
+        with open(bad_path, 'w') as f:
+            f.write("\n".join(bad_audio) + "\n")
+        print(f"Skipping {len(bad_audio)} row(s) with unreadable audio (listed in {bad_path}); "
+              f"first: {bad_audio[0]}")
+        total_lines = [line for line, ok in zip(total_lines, readable) if ok]
+
     # Reference audio must be 24 kHz for the mel extractor used in training. The target `audio` needs no
     # resampling here: the tokenizer resamples it to its own rate when encoding.
     ref_cache = {}
@@ -117,27 +141,35 @@ def main():
     changed = sum(1 for k, v in ref_cache.items() if k != v)
     print(f"Reference audio: {len(ref_cache)} unique file(s), {changed} resampled to 24 kHz mono")
 
+    def encode_batch(batch_lines):
+        """Encode a batch; if it fails, retry file by file and skip only the files that fail."""
+        try:
+            enc_res = tokenizer_12hz.encode([line['audio'] for line in batch_lines])
+            results = list(zip(enc_res.audio_codes, batch_lines))
+        except Exception as e:
+            print(f"Batch encode failed ({type(e).__name__}); retrying file by file")
+            results = []
+            for line in batch_lines:
+                try:
+                    results.append((tokenizer_12hz.encode([line['audio']]).audio_codes[0], line))
+                except Exception as e2:
+                    print(f"Skipping {line['audio']}: {type(e2).__name__}: {e2}")
+        encoded = []
+        for code, line in results:
+            line['audio_codes'] = code.cpu().tolist()
+            encoded.append(line)
+        return encoded
+
     def encode_rows(rows):
         encoded = []
         batch_lines = []
-        batch_audios = []
         for line in rows:
             batch_lines.append(line)
-            batch_audios.append(line['audio'])
-
             if len(batch_lines) >= BATCH_INFER_NUM:
-                enc_res = tokenizer_12hz.encode(batch_audios)
-                for code, line in zip(enc_res.audio_codes, batch_lines):
-                    line['audio_codes'] = code.cpu().tolist()
-                    encoded.append(line)
-                batch_lines.clear()
-                batch_audios.clear()
-
-        if len(batch_audios) > 0:
-            enc_res = tokenizer_12hz.encode(batch_audios)
-            for code, line in zip(enc_res.audio_codes, batch_lines):
-                line['audio_codes'] = code.cpu().tolist()
-                encoded.append(line)
+                encoded.extend(encode_batch(batch_lines))
+                batch_lines = []
+        if batch_lines:
+            encoded.extend(encode_batch(batch_lines))
         return encoded
 
     def write_jsonl(rows, path):
