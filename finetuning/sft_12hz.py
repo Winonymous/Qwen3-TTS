@@ -19,6 +19,7 @@ import os
 import shutil
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from dataset import TTSDataset
 from huggingface_hub import snapshot_download
@@ -170,20 +171,34 @@ def train():
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
+                # No `labels=` here: the model's built-in loss is Hugging Face's causal-LM loss, which shifts the
+                # labels once more, so passing the already-shifted labels[:, 1:] trained the talker to predict two
+                # frames ahead (check_loss_alignment.py: base CE 1.2 at the correct offset vs 7.8 at the shifted one).
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
                     output_hidden_states=True
                 )
+                talker_loss = F.cross_entropy(
+                    outputs.logits.float().reshape(-1, outputs.logits.shape[-1]),
+                    codec_0_labels[:, 1:].reshape(-1),
+                    ignore_index=-100,
+                )
 
+                # The sub-talker for a frame is conditioned on the hidden state that predicted that frame's first
+                # code, i.e. the one at the position *before* the frame's own input, as in generation.
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
+                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                sub_talker_logits, _ = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                # its built-in loss shifts the labels too; logits[:, j] predicts code group j + 1
+                sub_talker_loss = F.cross_entropy(
+                    sub_talker_logits.float().reshape(-1, sub_talker_logits.shape[-1]),
+                    talker_codec_ids[:, 1:].reshape(-1),
+                )
 
-                loss = outputs.loss + 0.3 * sub_talker_loss
+                loss = talker_loss + 0.3 * sub_talker_loss
 
                 accelerator.backward(loss)
 
@@ -201,7 +216,10 @@ def train():
                     done = True
 
             if step % 10 == 0:
-                accelerator.print(f"Epoch {epoch} | Step {step} | Opt step {opt_step} | Loss: {loss.item():.4f}")
+                accelerator.print(
+                    f"Epoch {epoch} | Step {step} | Opt step {opt_step} | Loss: {loss.item():.4f} "
+                    f"(talker {talker_loss.item():.4f}, sub-talker {sub_talker_loss.item():.4f})"
+                )
 
             if done:
                 break
