@@ -31,11 +31,21 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 class TTSDataset(Dataset):
-    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
+    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1,
+                 speaker2idx=None, default_speaker="speaker_test"):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
+        self.default_speaker = default_speaker
+        # speaker name (lowercased) -> index; pass one shared mapping when using several datasets (train + val)
+        if speaker2idx is None:
+            names = sorted({self._item_speaker(d) for d in data_list})
+            speaker2idx = {name: i for i, name in enumerate(names)}
+        self.speaker2idx = speaker2idx
+
+    def _item_speaker(self, item) -> str:
+        return (item.get("speaker") or self.default_speaker).lower()
 
     def __len__(self):
         return len(self.data_list)
@@ -152,6 +162,7 @@ class TTSDataset(Dataset):
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel,
             "language_id":language_id,
+            "speaker_idx":self.speaker2idx[self._item_speaker(item)],
         }
         
     def collate_fn(self, batch):
@@ -169,6 +180,7 @@ class TTSDataset(Dataset):
         attention_mask  = torch.zeros((b,t),dtype=torch.long)
         codec_0_labels  = torch.full((b, t), -100, dtype=torch.long)
         speaker_pos     = torch.zeros(b, dtype=torch.long)
+        speaker_idx     = torch.tensor([data['speaker_idx'] for data in batch], dtype=torch.long)
 
         for i,data in enumerate(batch):
             text_ids        = data['text_ids']
@@ -246,5 +258,6 @@ class TTSDataset(Dataset):
             'codec_0_labels':codec_0_labels,
             'codec_ids': codec_ids,
             'codec_mask':codec_mask,
-            'speaker_pos':speaker_pos
+            'speaker_pos':speaker_pos,
+            'speaker_idx':speaker_idx,
         }

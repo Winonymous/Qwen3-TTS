@@ -48,6 +48,10 @@ def main():
     parser.add_argument("--ref_path", type=str, default=None,
                         help="One reference audio used for every row (recommended: same ref for all rows). "
                              "If it is omitted and a row has no ref_audio, the median-length audio is used.")
+    parser.add_argument("--speaker_column", type=str, default=None,
+                        help="Column with the speaker name for each row (several speakers in one file)")
+    parser.add_argument("--speaker", type=str, default=None,
+                        help="Speaker name for every row, or only for rows with an empty --speaker_column cell")
     parser.add_argument("--language", type=str, default=None,
                         help="Language for every row, e.g. English (default: none = Auto). Must be a language the "
                              "base model knows. Use the same value as `language=` at inference.")
@@ -58,7 +62,8 @@ def main():
     with open(args.input_tsv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
         columns = reader.fieldnames or []
-        missing = [c for c in (args.audio_column, args.text_column) if c not in columns]
+        missing = [c for c in (args.audio_column, args.text_column, args.speaker_column)
+                   if c is not None and c not in columns]
         if missing:
             parser.error(f"column(s) {missing} not found in {args.input_tsv} (columns: {columns})")
         has_ref_column = args.ref_audio_column in columns
@@ -72,15 +77,23 @@ def main():
                 skipped += 1
                 continue
             item = {"audio": audio, "text": text, "ref_audio": ref_audio}
+            speaker = (row[args.speaker_column].strip() if args.speaker_column else "") or args.speaker
+            if speaker:
+                item["speaker"] = speaker
             if args.language:
                 item["language"] = args.language
             rows.append(item)
 
-    # Rows without a reference share the median-length clip of the dataset.
-    if any(not r["ref_audio"] for r in rows):
-        fallback = median_length_audio([r["audio"] for r in rows])
-        for r in rows:
-            r["ref_audio"] = r["ref_audio"] or fallback
+    # Rows without a reference share the median-length clip of their speaker (of the whole dataset if there are
+    # no speakers).
+    fallbacks = {}
+    for r in rows:
+        if r["ref_audio"]:
+            continue
+        key = r.get("speaker", "")
+        if key not in fallbacks:
+            fallbacks[key] = median_length_audio([x["audio"] for x in rows if x.get("speaker", "") == key])
+        r["ref_audio"] = fallbacks[key]
 
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
         for row in rows:

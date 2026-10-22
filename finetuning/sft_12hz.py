@@ -29,7 +29,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
-target_speaker_embedding = None
+SPEAKER_ID_START = 3000  # first codec-embedding id used for fine-tuned speakers
 
 
 def compute_losses(model, batch):
@@ -101,8 +101,6 @@ def compute_losses(model, batch):
 
 
 def train():
-    global target_speaker_embedding
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--output_model_path", type=str, default="output")
@@ -110,7 +108,9 @@ def train():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--speaker_name", type=str, default="speaker_test",
+                        help="Speaker for rows without a `speaker` field. Rows can carry their own `speaker` name to "
+                             "train several speakers at once.")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"],
                         help="Weight dtype. bfloat16 trains in pure bf16; float32 keeps fp32 master weights "
                              "(bf16 autocast for compute) and needs more memory.")
@@ -149,15 +149,37 @@ def train():
     # bf16 here means pure-bf16 training (no fp32 master weights); fp32 means autocast mixed precision.
     accelerator.print(f"Model weights dtype: {next(qwen3tts.model.parameters()).dtype}")
 
-    train_data = open(args.train_jsonl).readlines()
-    train_data = [json.loads(line) for line in train_data]
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
+    val_data = [json.loads(line) for line in open(args.val_jsonl).readlines()] if args.val_jsonl else []
+
+    # Speakers come from each row's `speaker` field (rows without one use --speaker_name). Names are lowercased
+    # because inference looks them up with `speaker.lower()`. Each speaker gets its own row in the codec embedding table.
+    speakers = sorted({(d.get("speaker") or args.speaker_name).lower() for d in train_data + val_data})
+    speaker2idx = {name: i for i, name in enumerate(speakers)}
+    existing_ids = dict(config.talker_config.spk_id or {})
+    used_ids = set(existing_ids.values())
+    speaker_ids = {}
+    next_id = SPEAKER_ID_START
+    for name in speakers:
+        if name in existing_ids:
+            speaker_ids[name] = existing_ids[name]
+            continue
+        while next_id in used_ids:
+            next_id += 1
+        if next_id >= config.talker_config.vocab_size:
+            raise RuntimeError(f"No free codec embedding id left for speaker {name!r}")
+        speaker_ids[name] = next_id
+        used_ids.add(next_id)
+    accelerator.print(f"Speakers: {speaker_ids}")
+
+    dataset = TTSDataset(train_data, qwen3tts.processor, config, speaker2idx=speaker2idx,
+                         default_speaker=args.speaker_name)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
     val_dataloader = None
     if args.val_jsonl:
-        val_data = [json.loads(line) for line in open(args.val_jsonl).readlines()]
-        val_dataset = TTSDataset(val_data, qwen3tts.processor, config)
+        val_dataset = TTSDataset(val_data, qwen3tts.processor, config, speaker2idx=speaker2idx,
+                                 default_speaker=args.speaker_name)
         val_dataloader = DataLoader(
             val_dataset, batch_size=args.val_batch_size or args.batch_size, shuffle=False,
             collate_fn=val_dataset.collate_fn,
@@ -175,6 +197,9 @@ def train():
             qwen3tts.model, optimizer, train_dataloader
         )
 
+    # Running mean of each speaker's encoder embedding over all training batches; it becomes that speaker's row.
+    speaker_sum, speaker_count = {}, {}
+
     def save_checkpoint(name):
         if not accelerator.is_main_process:
             return
@@ -187,12 +212,10 @@ def train():
             config_dict = json.load(f)
         config_dict["tts_model_type"] = "custom_voice"
         talker_config = config_dict.get("talker_config", {})
-        talker_config["spk_id"] = {
-            args.speaker_name.lower(): 3000
-        }
-        talker_config["spk_is_dialect"] = {
-            args.speaker_name.lower(): False
-        }
+        # only speakers that have been seen in training so far have a meaningful embedding
+        trained = [name for name in speakers if speaker_count.get(name, 0) > 0]
+        talker_config["spk_id"] = {name: speaker_ids[name] for name in trained}
+        talker_config["spk_is_dialect"] = {name: False for name in trained}
         config_dict["talker_config"] = talker_config
 
         with open(output_config_file, 'w', encoding='utf-8') as f:
@@ -211,7 +234,9 @@ def train():
             del state_dict[k]
 
         weight = state_dict['talker.model.codec_embedding.weight']
-        state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+        for name in trained:
+            mean_embedding = speaker_sum[name] / speaker_count[name]
+            weight[speaker_ids[name]] = mean_embedding.detach().to(weight.device).to(weight.dtype)
         save_path = os.path.join(output_dir, "model.safetensors")
         save_file(state_dict, save_path)
         accelerator.print(f"Saved {output_dir}")
@@ -264,8 +289,10 @@ def train():
             with accelerator.accumulate(model):
 
                 loss, talker_loss, sub_talker_loss, speaker_embedding = compute_losses(model, batch)
-                if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding
+                for emb, idx in zip(speaker_embedding.float(), batch['speaker_idx'].tolist()):
+                    name = speakers[idx]
+                    speaker_sum[name] = speaker_sum.get(name, 0) + emb
+                    speaker_count[name] = speaker_count.get(name, 0) + 1
 
                 accelerator.backward(loss)
 
