@@ -52,9 +52,12 @@ def main():
                         help="Column with the speaker name for each row (several speakers in one file)")
     parser.add_argument("--speaker", type=str, default=None,
                         help="Speaker name for every row, or only for rows with an empty --speaker_column cell")
+    parser.add_argument("--language_column", type=str, default=None,
+                        help="Column with the language name for each row (several languages in one file)")
     parser.add_argument("--language", type=str, default=None,
-                        help="Language for every row, e.g. English (default: none = Auto). Must be a language the "
-                             "base model knows. Use the same value as `language=` at inference.")
+                        help="Language for every row, or only for rows with an empty --language_column cell "
+                             "(default: none = Auto). A language the base model does not know is added during "
+                             "fine-tuning. Use the same value as `language=` at inference.")
     parser.add_argument("--check_audio", action="store_true",
                         help="Skip rows whose audio file does not exist")
     args = parser.parse_args()
@@ -62,7 +65,7 @@ def main():
     with open(args.input_tsv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
         columns = reader.fieldnames or []
-        missing = [c for c in (args.audio_column, args.text_column, args.speaker_column)
+        missing = [c for c in (args.audio_column, args.text_column, args.speaker_column, args.language_column)
                    if c is not None and c not in columns]
         if missing:
             parser.error(f"column(s) {missing} not found in {args.input_tsv} (columns: {columns})")
@@ -80,8 +83,9 @@ def main():
             speaker = (row[args.speaker_column].strip() if args.speaker_column else "") or args.speaker
             if speaker:
                 item["speaker"] = speaker
-            if args.language:
-                item["language"] = args.language
+            language = (row[args.language_column].strip() if args.language_column else "") or args.language
+            if language:
+                item["language"] = language
             rows.append(item)
 
     # Rows without a reference share the median-length clip of their speaker (of the whole dataset if there are

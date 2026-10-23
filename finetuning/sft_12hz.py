@@ -30,6 +30,43 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
 SPEAKER_ID_START = 3000  # first codec-embedding id used for fine-tuned speakers
+LANGUAGE_ID_RANGE = (2048, 2148)  # free slots among the codec special tokens (never produced as audio codes)
+
+
+def used_codec_ids(talker_config):
+    """Every codec-embedding id the config already uses (special tokens, speakers, languages)."""
+    used = set()
+    for key, value in talker_config.to_dict().items():
+        if isinstance(value, int) and key.endswith("_id"):
+            used.add(value)
+    for name in ("spk_id", "codec_language_id"):
+        used.update(v for v in (getattr(talker_config, name, None) or {}).values() if isinstance(v, int))
+    return used
+
+
+def register_languages(talker_config, languages):
+    """Give every language the checkpoint does not know a free codec-embedding id.
+
+    Updates `talker_config.codec_language_id` in place and returns {name: id} for the new languages.
+    "auto" needs no id (it means: no language token).
+    """
+    if talker_config.codec_language_id is None:
+        talker_config.codec_language_id = {}
+    used = used_codec_ids(talker_config)
+    candidates = list(range(*LANGUAGE_ID_RANGE)) + list(range(LANGUAGE_ID_RANGE[0]))
+    new_languages = {}
+    for lang in languages:
+        if lang == "auto" or lang in talker_config.codec_language_id:
+            continue
+        if "dialect" in lang:
+            raise ValueError(f"Language name {lang!r} must not contain 'dialect' (reserved by get_supported_languages)")
+        free = next((i for i in candidates if i not in used), None)
+        if free is None:
+            raise RuntimeError("No free codec-embedding id left for a new language")
+        used.add(free)
+        talker_config.codec_language_id[lang] = free
+        new_languages[lang] = free
+    return new_languages
 
 
 def compute_losses(model, batch):
@@ -122,6 +159,9 @@ def train():
                         help="Also save a checkpoint every N optimizer steps (0 = off)")
     parser.add_argument("--save_epochs", type=int, default=1,
                         help="Save a checkpoint every N epochs (0 = only the final one)")
+    parser.add_argument("--language_init_noise", type=float, default=0.1,
+                        help="New languages (not in the checkpoint) start from the mean embedding of the known "
+                             "languages plus Gaussian noise of this many standard deviations")
     parser.add_argument("--val_jsonl", type=str, default=None,
                         help="Held-out JSONL (e.g. the test split from prepare_data.py). When given, the validation "
                              "loss is computed before training, after every saved checkpoint and at the end of every "
@@ -172,6 +212,24 @@ def train():
         used_ids.add(next_id)
     accelerator.print(f"Speakers: {speaker_ids}")
 
+    # Languages come from each row's `language` field (missing = "auto", i.e. no language token). A language the
+    # checkpoint does not know gets a new id and a fresh embedding that is trained like the rest of the model.
+    languages = sorted({(d.get("language") or "auto").lower() for d in train_data + val_data})
+    new_languages = register_languages(config.talker_config, languages)
+    accelerator.print(f"Languages: {languages} (new: {new_languages})")
+    if new_languages:
+        codec_weight = qwen3tts.model.talker.model.codec_embedding.weight
+        known_ids = [i for n, i in config.talker_config.codec_language_id.items() if n not in new_languages]
+        with torch.no_grad():
+            if known_ids:
+                known_rows = codec_weight[known_ids].float()
+                mean, std = known_rows.mean(0), known_rows.std()
+            else:
+                mean, std = torch.zeros_like(codec_weight[0]).float(), codec_weight.float().std()
+            for lang_id in new_languages.values():
+                init = mean + torch.randn_like(mean) * std * args.language_init_noise
+                codec_weight[lang_id] = init.to(codec_weight.dtype)
+
     dataset = TTSDataset(train_data, qwen3tts.processor, config, speaker2idx=speaker2idx,
                          default_speaker=args.speaker_name)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
@@ -216,6 +274,8 @@ def train():
         trained = [name for name in speakers if speaker_count.get(name, 0) > 0]
         talker_config["spk_id"] = {name: speaker_ids[name] for name in trained}
         talker_config["spk_is_dialect"] = {name: False for name in trained}
+        # keeps the checkpoint's own languages and adds the new ones
+        talker_config["codec_language_id"] = dict(config.talker_config.codec_language_id)
         config_dict["talker_config"] = talker_config
 
         with open(output_config_file, 'w', encoding='utf-8') as f:
