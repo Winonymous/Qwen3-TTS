@@ -11,7 +11,7 @@ Base64 URLs make the JSONL large, so prefer a dataset whose files live on disk w
 
 Example:
     python hf_to_jsonl.py --dataset my-org/yoruba-tts --split train \
-        --audio_column audio --text_column sentence --speaker_column voice_over --language yoruba \
+        --audio_column audio --text_column sentence --speaker_column speaker --language yoruba \
         --output_jsonl train_raw.jsonl
     python prepare_data.py --input_jsonl train_raw.jsonl --output_jsonl train_with_codes.jsonl
 """
