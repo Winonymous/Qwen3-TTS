@@ -15,8 +15,12 @@
 # limitations under the License.
 from typing import Any, List, Tuple, Union
 
+import base64
+import io
+
 import librosa
 import numpy as np
+import soundfile as sf
 import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
@@ -29,6 +33,8 @@ AudioLike = Union[
 ]
 
 MaybeList = Union[Any, List[Any]]
+
+TARGET_SR = 24000
 
 class TTSDataset(Dataset):
     def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1,
@@ -51,13 +57,18 @@ class TTSDataset(Dataset):
         return len(self.data_list)
     
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
-        
-        audio, sr = librosa.load(x, sr=None, mono=True)
+        # Always returns 24 kHz mono (the only rate the mel extractor supports), resampled in memory.
+        # `x` is a file path or a `data:audio;base64,...` URL, so no resampled copy has to exist on disk.
+        if x.startswith("data:audio"):
+            audio, sr = sf.read(io.BytesIO(base64.b64decode(x.split(",", 1)[1])), dtype="float32", always_2d=False)
+            if audio.ndim > 1:
+                audio = np.mean(audio, axis=-1)
+            if sr != TARGET_SR:
+                audio = librosa.resample(y=audio, orig_sr=sr, target_sr=TARGET_SR)
+        else:
+            audio, _ = librosa.load(x, sr=TARGET_SR, mono=True)
 
-        if audio.ndim > 1:
-            audio = np.mean(audio, axis=-1)
-
-        return audio.astype(np.float32), int(sr)
+        return audio.astype(np.float32), TARGET_SR
 
     def _normalize_audio_inputs(self, audios: Union[AudioLike, List[AudioLike]]) -> List[Tuple[np.ndarray, int]]:
         """
@@ -130,7 +141,6 @@ class TTSDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data_list[idx]
 
-        audio_path  = item["audio"]
         text        = item["text"]
         audio_codes = item["audio_codes"]
         language        = item.get('language','Auto')
