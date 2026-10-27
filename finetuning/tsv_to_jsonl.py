@@ -12,6 +12,8 @@ import csv
 import json
 import os
 
+from logging_utils import setup_logging
+
 
 def audio_duration(path):
     import soundfile as sf
@@ -60,7 +62,10 @@ def main():
                              "fine-tuning. Use the same value as `language=` at inference.")
     parser.add_argument("--check_audio", action="store_true",
                         help="Skip rows whose audio file does not exist")
+    parser.add_argument("--log_file", type=str, default=None,
+                        help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
+    setup_logging(args.log_file or args.output_jsonl + ".log", args)
 
     with open(args.input_tsv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from dataset import TTSDataset
 from huggingface_hub import snapshot_download
+from logging_utils import setup_logging
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
@@ -170,7 +171,11 @@ def train():
                         help="Validation batch size (0 = same as --batch_size)")
     parser.add_argument("--no_initial_eval", action="store_true",
                         help="Skip the validation pass before training starts")
+    parser.add_argument("--log_file", type=str, default=None,
+                        help="Everything printed (losses, warnings, errors) is also written here "
+                             "(default: <output_model_path>/train.log)")
     args = parser.parse_args()
+    setup_logging(args.log_file or os.path.join(args.output_model_path, "train.log"), args)
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
 

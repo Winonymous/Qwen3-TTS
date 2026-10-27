@@ -24,6 +24,7 @@ from collections import defaultdict
 
 import librosa
 import soundfile as sf
+from logging_utils import setup_logging
 from qwen_tts import Qwen3TTSTokenizer
 
 BATCH_INFER_NUM = 32
@@ -91,7 +92,10 @@ def main():
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
+    parser.add_argument("--log_file", type=str, default=None,
+                        help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
+    setup_logging(args.log_file or args.output_jsonl + ".log", args)
     if not 0.0 <= args.test_ratio < 1.0:
         parser.error("--test_ratio must be in [0, 1)")
     if args.test_jsonl is None:
