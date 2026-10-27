@@ -56,6 +56,18 @@ def audio_is_readable(path):
         return False
 
 
+def audio_duration(path):
+    """Duration in seconds, or None if it cannot be determined cheaply (`path` may be a data: URL)."""
+    try:
+        if path.startswith("data:audio"):
+            info = sf.info(io.BytesIO(base64.b64decode(path.split(",", 1)[1])))
+        else:
+            info = sf.info(path)
+        return info.frames / info.samplerate
+    except Exception:
+        return None
+
+
 def split_rows(rows, test_ratio, seed):
     """Split rows into (train, test), keeping the original order inside each split.
 
@@ -92,6 +104,11 @@ def main():
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
+    parser.add_argument("--max_duration", type=float, default=0.0,
+                        help="Drop rows whose target audio is longer than this many seconds (0 = no limit). "
+                             "Very long clips use a lot of memory in training and tend to hurt it.")
+    parser.add_argument("--min_duration", type=float, default=0.0,
+                        help="Drop rows whose target audio is shorter than this many seconds (0 = no limit)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
@@ -120,6 +137,18 @@ def main():
         print(f"Skipping {len(bad_audio)} row(s) with unreadable audio (listed in {bad_path}); "
               f"first: {bad_audio[0]}")
         total_lines = [line for line, ok in zip(total_lines, readable) if ok]
+
+    if args.max_duration > 0 or args.min_duration > 0:
+        kept = []
+        for line in total_lines:
+            d = audio_duration(line['audio'])
+            too_long = args.max_duration > 0 and d is not None and d > args.max_duration
+            too_short = args.min_duration > 0 and d is not None and d < args.min_duration
+            if not (too_long or too_short):
+                kept.append(line)
+        print(f"Duration filter (min {args.min_duration}s, max {args.max_duration}s): kept {len(kept)} of "
+              f"{len(total_lines)} rows, dropped {len(total_lines) - len(kept)}")
+        total_lines = kept
 
     # No audio is resampled or written here: the tokenizer resamples `audio` in memory when encoding, and
     # dataset.py resamples `ref_audio` to 24 kHz in memory when it is loaded for training.

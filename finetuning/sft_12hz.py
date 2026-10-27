@@ -169,6 +169,9 @@ def train():
                              "epoch, and the best checkpoint is kept as checkpoint-best.")
     parser.add_argument("--val_batch_size", type=int, default=0,
                         help="Validation batch size (0 = same as --batch_size)")
+    parser.add_argument("--max_codec_frames", type=int, default=0,
+                        help="Drop train/val rows whose audio has more codec frames than this (0 = no limit). "
+                             "The codec runs at 12.5 frames per second, so 375 frames = 30 s.")
     parser.add_argument("--no_initial_eval", action="store_true",
                         help="Skip the validation pass before training starts")
     parser.add_argument("--log_file", type=str, default=None,
@@ -196,6 +199,14 @@ def train():
 
     train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
     val_data = [json.loads(line) for line in open(args.val_jsonl).readlines()] if args.val_jsonl else []
+    if args.max_codec_frames > 0:
+        n_train, n_val = len(train_data), len(val_data)
+        train_data = [d for d in train_data if len(d["audio_codes"]) <= args.max_codec_frames]
+        val_data = [d for d in val_data if len(d["audio_codes"]) <= args.max_codec_frames]
+        accelerator.print(f"--max_codec_frames {args.max_codec_frames}: train {len(train_data)}/{n_train}, "
+                          f"val {len(val_data)}/{n_val} rows kept")
+        if not train_data:
+            raise SystemExit("No training rows left after --max_codec_frames")
 
     # Speakers come from each row's `speaker` field (rows without one use --speaker_name). Names are lowercased
     # because inference looks them up with `speaker.lower()`. Each speaker gets its own row in the codec embedding table.
