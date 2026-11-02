@@ -16,6 +16,7 @@
 import argparse
 import json
 import os
+import random
 import shutil
 
 import torch
@@ -169,11 +170,22 @@ def train():
                              "epoch, and the best checkpoint is kept as checkpoint-best.")
     parser.add_argument("--val_batch_size", type=int, default=0,
                         help="Validation batch size (0 = same as --batch_size)")
+    parser.add_argument("--num_samples", type=int, default=0,
+                        help="Smoke test: train on a random subset of this many rows (0 = all). The validation "
+                             "set is cut to --num_val_samples (default: a fifth of this, at least 1).")
+    parser.add_argument("--num_val_samples", type=int, default=0,
+                        help="With --num_samples: number of validation rows to use")
+    parser.add_argument("--sample_seed", type=int, default=42, help="Seed for --num_samples")
     parser.add_argument("--max_codec_frames", type=int, default=0,
                         help="Drop train/val rows whose audio has more codec frames than this (0 = no limit). "
                              "The codec runs at 12.5 frames per second, so 375 frames = 30 s.")
     parser.add_argument("--no_initial_eval", action="store_true",
                         help="Skip the validation pass before training starts")
+    parser.add_argument("--wandb_project", type=str, default=None,
+                        help="Log losses, learning rate and validation to this Weights & Biases project "
+                             "(default: wandb is off). Use WANDB_MODE=offline on a node without internet.")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--log_file", type=str, default=None,
                         help="Everything printed (losses, warnings, errors) is also written here "
                              "(default: <output_model_path>/train.log)")
@@ -181,6 +193,19 @@ def train():
     setup_logging(args.log_file or os.path.join(args.output_model_path, "train.log"), args)
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+
+    wandb_run = None
+    if args.wandb_project and accelerator.is_main_process:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name,
+            config=vars(args), dir=args.output_model_path,
+        )
+
+    def wandb_log(data, step):
+        if wandb_run is not None:
+            wandb_run.log(data, step=step)
 
     MODEL_PATH = args.init_model_path
     if not os.path.isdir(MODEL_PATH):
@@ -207,6 +232,16 @@ def train():
                           f"val {len(val_data)}/{n_val} rows kept")
         if not train_data:
             raise SystemExit("No training rows left after --max_codec_frames")
+    if args.num_samples > 0:
+        rng = random.Random(args.sample_seed)
+        n_val = args.num_val_samples or max(1, args.num_samples // 5)
+        n_train_all, n_val_all = len(train_data), len(val_data)
+        if len(train_data) > args.num_samples:
+            train_data = rng.sample(train_data, args.num_samples)
+        if len(val_data) > n_val:
+            val_data = rng.sample(val_data, n_val)
+        accelerator.print(f"--num_samples (smoke test): train {len(train_data)}/{n_train_all}, "
+                          f"val {len(val_data)}/{n_val_all} rows")
 
     # Speakers come from each row's `speaker` field (rows without one use --speaker_name). Names are lowercased
     # because inference looks them up with `speaker.lower()`. Each speaker gets its own row in the codec embedding table.
@@ -340,6 +375,8 @@ def train():
         if val_dataloader is None:
             return
         val_loss, val_talker, val_sub = evaluate()
+        wandb_log({"val/loss": val_loss, "val/talker_loss": val_talker, "val/sub_talker_loss": val_sub},
+                  step=opt_step)
         accelerator.print(
             f"Validation @ {tag}: loss {val_loss:.4f} (talker {val_talker:.4f}, sub-talker {val_sub:.4f})"
         )
@@ -373,13 +410,18 @@ def train():
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
 
                 optimizer.step()
                 optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 opt_step += 1
+                wandb_log({
+                    "train/loss": loss.item(), "train/talker_loss": talker_loss.item(),
+                    "train/sub_talker_loss": sub_talker_loss.item(), "train/grad_norm": float(grad_norm),
+                    "train/lr": optimizer.param_groups[0]["lr"], "train/epoch": epoch,
+                }, step=opt_step)
                 if args.save_steps > 0 and opt_step % args.save_steps == 0:
                     save_checkpoint(f"checkpoint-step-{opt_step}")
                     run_eval(f"opt step {opt_step}")
@@ -402,6 +444,10 @@ def train():
         if (args.save_epochs > 0 and (epoch + 1) % args.save_epochs == 0) or epoch == num_epochs - 1:
             save_checkpoint(f"checkpoint-epoch-{epoch}")
         run_eval(f"end of epoch {epoch}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
+
 
 if __name__ == "__main__":
     train()
