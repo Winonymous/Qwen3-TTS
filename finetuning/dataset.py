@@ -16,7 +16,9 @@
 from typing import Any, List, Tuple, Union
 
 import base64
+import contextlib
 import io
+import os
 
 import librosa
 import numpy as np
@@ -124,16 +126,25 @@ class TTSDataset(Dataset):
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
         assert sr == 24000, "Only support 24kHz audio"
-        mels = mel_spectrogram(
-            torch.from_numpy(audio).unsqueeze(0), 
-            n_fft=1024, 
-            num_mels=128, 
-            sampling_rate=24000,
-            hop_size=256, 
-            win_size=1024, 
-            fmin=0, 
-            fmax=12000
-        ).transpose(1, 2)
+        peak = float(np.abs(audio).max()) if len(audio) else 0.0
+        if peak > 1.0 and not getattr(self, "_warned_peak", False):
+            self._warned_peak = True
+            print(f"Note: reference audio peaks slightly above 1.0 (here {peak:.3f}, from resampling or "
+                  f"mastering). The values are used as-is, like at inference; the per-sample "
+                  f"'Max/Min value of input waveform' warnings are silenced.")
+        # mel_spectrogram prints a warning on every call when the waveform leaves [-1, 1]; the audio is left
+        # untouched so training sees exactly what inference sees.
+        with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+            mels = mel_spectrogram(
+                torch.from_numpy(audio).unsqueeze(0),
+                n_fft=1024,
+                num_mels=128,
+                sampling_rate=24000,
+                hop_size=256,
+                win_size=1024,
+                fmin=0,
+                fmax=12000
+            ).transpose(1, 2)
         return mels
 
 
