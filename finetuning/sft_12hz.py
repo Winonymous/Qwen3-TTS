@@ -27,6 +27,7 @@ from accelerate import Accelerator
 from dataset import TTSDataset
 from huggingface_hub import snapshot_download
 from logging_utils import setup_logging
+from text_utils import normalize_text
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
@@ -186,6 +187,10 @@ def train():
     parser.add_argument("--max_codec_frames", type=int, default=0,
                         help="Drop train/val rows whose audio has more codec frames than this (0 = no limit). "
                              "The codec runs at 12.5 frames per second, so 375 frames = 30 s.")
+    parser.add_argument("--normalize_text", action="store_true",
+                        help="Normalize the text of every train/val row (Unicode NFC, invisible characters removed, "
+                             "whitespace collapsed) while loading. Use it on JSONL files prepared without "
+                             "normalization; no re-encoding needed. Also applies to --sample_file sentences.")
     parser.add_argument("--max_text_chars", type=int, default=0,
                         help="Drop train/val rows whose text has more characters than this (0 = no limit). "
                              "Batches are padded to their longest row, so one runaway transcript (for example a "
@@ -248,6 +253,14 @@ def train():
 
     train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
     val_data = [json.loads(line) for line in open(args.val_jsonl).readlines()] if args.val_jsonl else []
+    if args.normalize_text:
+        changed = 0
+        for d in train_data + val_data:
+            clean = normalize_text(d["text"])
+            changed += clean != d["text"]
+            d["text"] = clean
+        accelerator.print(f"--normalize_text changed {changed} of {len(train_data) + len(val_data)} row(s)")
+
     for name, rows in (("train", train_data), ("val", val_data)):
         if rows:
             texts = sorted(len(d["text"]) for d in rows)
@@ -399,6 +412,8 @@ def train():
         if args.sample_file:
             with open(args.sample_file, encoding="utf-8") as f:
                 sample_texts = [line.strip() for line in f if line.strip()]
+            if args.normalize_text:
+                sample_texts = [normalize_text(t) for t in sample_texts]
             real_languages = [lang for lang in languages if lang != "auto"]
             sample_language = (args.sample_language or (real_languages[0] if real_languages else "auto")).lower()
             sample_items = [(sp, sample_language, t) for sp in speakers for t in sample_texts]

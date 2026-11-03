@@ -26,6 +26,7 @@ import librosa
 import soundfile as sf
 from logging_utils import setup_logging
 from qwen_tts import Qwen3TTSTokenizer
+from text_utils import normalize_text
 
 BATCH_INFER_NUM = 32
 
@@ -120,6 +121,11 @@ def main():
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
+    parser.add_argument("--no_normalize_text", dest="normalize_text", action="store_false",
+                        help="Keep the text exactly as it is. By default it is normalized (Unicode NFC, invisible "
+                             "characters removed, whitespace collapsed) so that the same word is always spelled "
+                             "the same way. Apply the same normalization at inference "
+                             "(text_utils.normalize_text).")
     parser.add_argument("--trim_silence", action="store_true",
                         help="Cut the leading and trailing silence of every target clip before encoding. The model "
                              "learns the silence it is trained on, so clips with long pauses at the edges give "
@@ -166,8 +172,16 @@ def main():
               f"first: {bad_audio[0]}")
         total_lines = [line for line, ok in zip(total_lines, readable) if ok]
 
+    if args.normalize_text:
+        changed = 0
+        for line in total_lines:
+            clean = normalize_text(line['text'])
+            changed += clean != line['text']
+            line['text'] = clean
+        print(f"Text normalization changed {changed} of {len(total_lines)} row(s)")
+
     if args.max_text_chars > 0:
-        long_rows = [line for line in total_lines if len(line['text']) > args.max_text_chars]
+        long_rows =[line for line in total_lines if len(line['text']) > args.max_text_chars]
         if long_rows:
             long_path = args.output_jsonl + ".long_text.txt"
             with open(long_path, 'w', encoding='utf-8') as f:

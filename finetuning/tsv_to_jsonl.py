@@ -13,6 +13,7 @@ import json
 import os
 
 from logging_utils import setup_logging
+from text_utils import normalize_text
 
 
 def audio_duration(path):
@@ -60,6 +61,11 @@ def main():
                         help="Language for every row, or only for rows with an empty --language_column cell "
                              "(default: none = Auto). A language the base model does not know is added during "
                              "fine-tuning. Use the same value as `language=` at inference.")
+    parser.add_argument("--no_normalize_text", dest="normalize_text", action="store_false",
+                        help="Keep the text exactly as it is in the TSV. By default it is normalized (Unicode NFC, "
+                             "invisible characters removed, whitespace collapsed) so that the same word is always "
+                             "spelled the same way. Apply the same normalization at inference "
+                             "(text_utils.normalize_text).")
     parser.add_argument("--max_text_chars", type=int, default=0,
                         help="Skip rows whose text has more characters than this (0 = no limit). Catches runaway "
                              "transcripts, e.g. a repeated ASR hallucination.")
@@ -79,10 +85,14 @@ def main():
             parser.error(f"column(s) {missing} not found in {args.input_tsv} (columns: {columns})")
         has_ref_column = args.ref_audio_column in columns
 
-        rows, skipped, too_long = [], 0, []
+        rows, skipped, too_long, normalized = [], 0, [], 0
         for row in reader:
             audio = row[args.audio_column].strip()
             text = row[args.text_column].strip()
+            if args.normalize_text:
+                clean = normalize_text(text)
+                normalized += clean != text
+                text = clean
             ref_audio = args.ref_path or (row[args.ref_audio_column].strip() if has_ref_column else "")
             if not audio or not text or (args.check_audio and not os.path.isfile(audio)):
                 skipped += 1
@@ -119,6 +129,8 @@ def main():
         print(f"Skipped {len(too_long)} row(s) with more than {args.max_text_chars} characters of text; "
               f"longest: {max(n for _, n in too_long)} chars. First few: "
               + ", ".join(f"{a} ({n})" for a, n in too_long[:5]))
+    if args.normalize_text:
+        print(f"Text normalization changed {normalized} row(s)")
     print(f"Wrote {len(rows)} rows to {args.output_jsonl} (skipped {skipped})")
 
 
