@@ -40,7 +40,7 @@ TARGET_SR = 24000
 
 class TTSDataset(Dataset):
     def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1,
-                 speaker2idx=None, default_speaker="speaker_test"):
+                 speaker2idx=None, default_speaker="speaker_test", language2idx=None):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
@@ -51,9 +51,17 @@ class TTSDataset(Dataset):
             names = sorted({self._item_speaker(d) for d in data_list})
             speaker2idx = {name: i for i, name in enumerate(names)}
         self.speaker2idx = speaker2idx
+        # language name (lowercased, "auto" when missing) -> index; used to report validation loss per language
+        if language2idx is None:
+            names = sorted({self._item_language(d) for d in data_list})
+            language2idx = {name: i for i, name in enumerate(names)}
+        self.language2idx = language2idx
 
     def _item_speaker(self, item) -> str:
         return (item.get("speaker") or self.default_speaker).lower()
+
+    def _item_language(self, item) -> str:
+        return str(item.get("language") or "auto").lower()
 
     def __len__(self):
         return len(self.data_list)
@@ -184,6 +192,7 @@ class TTSDataset(Dataset):
             "ref_mel":ref_mel,
             "language_id":language_id,
             "speaker_idx":self.speaker2idx[self._item_speaker(item)],
+            "language_idx":self.language2idx[self._item_language(item)],
         }
         
     def collate_fn(self, batch):
@@ -202,6 +211,7 @@ class TTSDataset(Dataset):
         codec_0_labels  = torch.full((b, t), -100, dtype=torch.long)
         speaker_pos     = torch.zeros(b, dtype=torch.long)
         speaker_idx     = torch.tensor([data['speaker_idx'] for data in batch], dtype=torch.long)
+        language_idx    = torch.tensor([data['language_idx'] for data in batch], dtype=torch.long)
 
         for i,data in enumerate(batch):
             text_ids        = data['text_ids']
@@ -281,4 +291,5 @@ class TTSDataset(Dataset):
             'codec_mask':codec_mask,
             'speaker_pos':speaker_pos,
             'speaker_idx':speaker_idx,
+            'language_idx':language_idx,
         }

@@ -20,6 +20,7 @@ import os
 import random
 import shutil
 import traceback
+from collections import Counter
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +32,7 @@ from text_utils import normalize_text
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import AutoConfig
 
 SPEAKER_ID_START = 3000  # first codec-embedding id used for fine-tuned speakers
@@ -74,10 +75,12 @@ def register_languages(talker_config, languages):
     return new_languages
 
 
-def compute_losses(model, batch):
+def compute_losses(model, batch, per_sample=False):
     """Training / validation loss for one batch.
 
-    Returns (loss, talker_loss, sub_talker_loss, speaker_embedding).
+    Returns (loss, talker_loss, sub_talker_loss, speaker_embedding). With `per_sample=True` a fifth element
+    (talker_loss_per_sample, sub_talker_loss_per_sample), each of shape (batch,), is returned as well; it is used to
+    report validation loss per language and speaker.
     """
     input_ids = batch['input_ids']
     codec_ids = batch['codec_ids']
@@ -140,7 +143,26 @@ def compute_losses(model, batch):
     )
 
     loss = talker_loss + 0.3 * sub_talker_loss
-    return loss, talker_loss, sub_talker_loss, speaker_embedding
+    if not per_sample:
+        return loss, talker_loss, sub_talker_loss, speaker_embedding
+
+    batch_size = input_ids.shape[0]
+    labels = codec_0_labels[:, 1:]
+    token_loss = F.cross_entropy(
+        outputs.logits.float().reshape(-1, outputs.logits.shape[-1]), labels.reshape(-1),
+        ignore_index=-100, reduction="none",
+    ).view(batch_size, -1)
+    talker_ps = token_loss.sum(1) / (labels != -100).sum(1).clamp(min=1)
+
+    frames = codec_mask.sum(1)  # codec frames per sample; talker_codec_ids is ordered sample by sample
+    frame_loss = F.cross_entropy(
+        sub_talker_logits.float().reshape(-1, sub_talker_logits.shape[-1]),
+        talker_codec_ids[:, 1:].reshape(-1), reduction="none",
+    ).view(talker_codec_ids.shape[0], -1).mean(1)
+    owner = torch.arange(batch_size, device=frames.device).repeat_interleave(frames)
+    sub_ps = torch.zeros(batch_size, device=frame_loss.device).index_add_(0, owner, frame_loss)
+    sub_ps = sub_ps / frames.clamp(min=1)
+    return loss, talker_loss, sub_talker_loss, speaker_embedding, (talker_ps, sub_ps)
 
 
 def train():
@@ -187,6 +209,19 @@ def train():
     parser.add_argument("--max_codec_frames", type=int, default=0,
                         help="Drop train/val rows whose audio has more codec frames than this (0 = no limit). "
                              "The codec runs at 12.5 frames per second, so 375 frames = 30 s.")
+    parser.add_argument("--balance_by", type=str, default="none",
+                        choices=["none", "language", "speaker", "language_speaker"],
+                        help="Sample training rows so that small groups are seen more often than their share of "
+                             "the data. none = plain shuffling. Rows are drawn with replacement; an epoch is "
+                             "still len(train) draws.")
+    parser.add_argument("--balance_power", type=float, default=0.5,
+                        help="With --balance_by: a row's sampling weight is group_size ** -power. 0 = no "
+                             "balancing, 1 = every group equally likely, 0.5 = square-root balancing (a milder "
+                             "compromise that repeats small groups less).")
+    parser.add_argument("--best_by", type=str, default="pooled", choices=["pooled", "macro"],
+                        help="What picks checkpoint-best: pooled = validation loss over all rows (large groups "
+                             "dominate); macro = mean of the per-(language, speaker) losses (every group counts "
+                             "equally; recommended for several languages).")
     parser.add_argument("--normalize_text", action="store_true",
                         help="Normalize the text of every train/val row (Unicode NFC, invisible characters removed, "
                              "whitespace collapsed) while loading. Use it on JSONL files prepared without "
@@ -333,15 +368,34 @@ def train():
                 init = mean + torch.randn_like(mean) * std * args.language_init_noise
                 codec_weight[lang_id] = init.to(codec_weight.dtype)
 
+    language2idx = {name: i for i, name in enumerate(languages)}
     dataset = TTSDataset(train_data, qwen3tts.processor, config, speaker2idx=speaker2idx,
-                         default_speaker=args.speaker_name)
-    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn,
-                                  num_workers=args.num_workers, persistent_workers=args.num_workers > 0)
+                         default_speaker=args.speaker_name, language2idx=language2idx)
+
+    sampler = None
+    if args.balance_by != "none":
+        def group_key(d):
+            lang = (d.get("language") or "auto").lower()
+            spk = (d.get("speaker") or args.speaker_name).lower()
+            return {"language": lang, "speaker": spk, "language_speaker": f"{lang}/{spk}"}[args.balance_by]
+
+        keys = [group_key(d) for d in train_data]
+        counts = Counter(keys)
+        weights = [counts[k] ** -args.balance_power for k in keys]
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_data), replacement=True)
+        total_weight = sum(weights)
+        for group in sorted(counts):
+            share = counts[group] ** (1 - args.balance_power) / total_weight
+            accelerator.print(f"Balanced sampling [{group}]: {counts[group]} rows = "
+                              f"{counts[group] / len(train_data):.1%} of the data, drawn {share:.1%} of the time")
+    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
+                                  collate_fn=dataset.collate_fn, num_workers=args.num_workers,
+                                  persistent_workers=args.num_workers > 0)
 
     val_dataloader = None
     if args.val_jsonl:
         val_dataset = TTSDataset(val_data, qwen3tts.processor, config, speaker2idx=speaker2idx,
-                                 default_speaker=args.speaker_name)
+                                 default_speaker=args.speaker_name, language2idx=language2idx)
         val_dataloader = DataLoader(
             val_dataset, batch_size=args.val_batch_size or args.batch_size, shuffle=False,
             collate_fn=val_dataset.collate_fn, num_workers=args.num_workers,
@@ -477,39 +531,71 @@ def train():
 
     best_val = float("inf")
 
+    n_groups = len(languages) * len(speakers)
+
     def evaluate():
-        """Mean (loss, talker, sub-talker) over the validation set."""
+        """Pooled mean (loss, talker, sub-talker) over the validation set, and the same per (language, speaker).
+
+        The pooled numbers are batch means weighted by batch size (as in earlier runs). The per-group numbers
+        average each sample's own loss, so they differ slightly from the pooled ones.
+        """
         model.eval()
         sums = torch.zeros(4, device=accelerator.device)
+        group_sums = torch.zeros(n_groups, 4, device=accelerator.device)  # loss, talker, sub-talker, count
         with torch.no_grad():
             for i, val_batch in enumerate(val_dataloader):
                 if i % 50 == 0:
                     accelerator.print(f"  validation batch {i}/{len(val_dataloader)}")
                 with autocast_ctx():
-                    loss, talker_loss, sub_talker_loss, _ = compute_losses(model, val_batch)
+                    loss, talker_loss, sub_talker_loss, _, (talker_ps, sub_ps) = compute_losses(
+                        model, val_batch, per_sample=True)
                 n = val_batch['input_ids'].shape[0]
                 sums += torch.tensor(
                     [loss.item() * n, talker_loss.item() * n, sub_talker_loss.item() * n, n],
                     device=accelerator.device,
                 )
+                group_id = val_batch['language_idx'] * len(speakers) + val_batch['speaker_idx']
+                per_sample = torch.stack(
+                    [talker_ps + 0.3 * sub_ps, talker_ps, sub_ps, torch.ones_like(talker_ps)], dim=1)
+                group_sums.index_add_(0, group_id.to(accelerator.device), per_sample.float())
         sums = accelerator.reduce(sums, reduction="sum")
+        group_sums = accelerator.reduce(group_sums, reduction="sum")
         model.train()
-        return (sums[:3] / sums[3]).tolist()
+
+        groups = {}
+        for g in range(n_groups):
+            count = group_sums[g, 3].item()
+            if count > 0:
+                key = (languages[g // len(speakers)], speakers[g % len(speakers)])
+                groups[key] = (*(group_sums[g, :3] / count).tolist(), int(count))
+        return (sums[:3] / sums[3]).tolist(), groups
 
     def run_eval(tag, keep_best=True):
         nonlocal best_val
         if val_dataloader is None:
             return
-        val_loss, val_talker, val_sub = evaluate()
-        wandb_log({"val/loss": val_loss, "val/talker_loss": val_talker, "val/sub_talker_loss": val_sub},
-                  step=opt_step)
+        (val_loss, val_talker, val_sub), groups = evaluate()
+        macro = sum(g[0] for g in groups.values()) / len(groups) if groups else val_loss
+        log = {"val/loss": val_loss, "val/talker_loss": val_talker, "val/sub_talker_loss": val_sub,
+               "val/macro_loss": macro}
+        for (lang, spk), (g_loss, g_talker, g_sub, _) in groups.items():
+            log[f"val_group/{lang}_{spk}/loss"] = g_loss
+            log[f"val_group/{lang}_{spk}/talker_loss"] = g_talker
+            log[f"val_group/{lang}_{spk}/sub_talker_loss"] = g_sub
+        wandb_log(log, step=opt_step)
         accelerator.print(
-            f"Validation @ {tag}: loss {val_loss:.4f} (talker {val_talker:.4f}, sub-talker {val_sub:.4f})"
+            f"Validation @ {tag}: loss {val_loss:.4f} (talker {val_talker:.4f}, sub-talker {val_sub:.4f}), "
+            f"macro {macro:.4f} over {len(groups)} group(s)"
         )
-        if keep_best and val_loss < best_val:
-            best_val = val_loss
+        if len(groups) > 1:
+            for (lang, spk), (g_loss, g_talker, g_sub, count) in sorted(groups.items()):
+                accelerator.print(f"    {lang}/{spk}: loss {g_loss:.4f} (talker {g_talker:.4f}, "
+                                  f"sub-talker {g_sub:.4f}), {count} rows")
+        score = macro if args.best_by == "macro" else val_loss
+        if keep_best and score < best_val:
+            best_val = score
             save_checkpoint("checkpoint-best")
-            accelerator.print(f"New best validation loss {val_loss:.4f} -> checkpoint-best")
+            accelerator.print(f"New best validation {args.best_by} loss {score:.4f} -> checkpoint-best")
 
     num_epochs = args.num_epochs
     opt_step = 0  # completed optimizer steps
