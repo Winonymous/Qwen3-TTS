@@ -56,6 +56,22 @@ def audio_is_readable(path):
         return False
 
 
+def load_trimmed(path, top_db, keep_ms, sr=24000):
+    """Load `path` (or a data: URL) as mono float32 at `sr` and cut the leading/trailing silence.
+
+    Everything quieter than `top_db` below the peak counts as silence; `keep_ms` of it is kept on each side so the
+    speech does not start or stop abruptly. Audio that is silent throughout is returned untouched.
+    """
+    if path.startswith("data:audio"):
+        path = io.BytesIO(base64.b64decode(path.split(",", 1)[1]))
+    y, _ = librosa.load(path, sr=sr, mono=True)
+    _, (start, end) = librosa.effects.trim(y, top_db=top_db)
+    if end <= start:
+        return y
+    keep = int(sr * keep_ms / 1000)
+    return y[max(0, start - keep):min(len(y), end + keep)]
+
+
 def audio_duration(path):
     """Duration in seconds, or None if it cannot be determined cheaply (`path` may be a data: URL)."""
     try:
@@ -104,6 +120,15 @@ def main():
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
+    parser.add_argument("--trim_silence", action="store_true",
+                        help="Cut the leading and trailing silence of every target clip before encoding. The model "
+                             "learns the silence it is trained on, so clips with long pauses at the edges give "
+                             "generated speech with long pauses before and after.")
+    parser.add_argument("--trim_top_db", type=float, default=35.0,
+                        help="With --trim_silence: sound this many dB below the clip's peak counts as silence "
+                             "(lower = trims more)")
+    parser.add_argument("--keep_silence_ms", type=int, default=100,
+                        help="With --trim_silence: silence kept before and after the speech, in milliseconds")
     parser.add_argument("--max_text_chars", type=int, default=0,
                         help="Drop rows whose text has more characters than this (0 = no limit). Catches runaway "
                              "transcripts, e.g. a repeated ASR hallucination, which can use all the GPU memory.")
@@ -167,17 +192,23 @@ def main():
     # No audio is resampled or written here: the tokenizer resamples `audio` in memory when encoding, and
     # dataset.py resamples `ref_audio` to 24 kHz in memory when it is loaded for training.
 
+    def encode_audios(audios):
+        if args.trim_silence:
+            waves = [load_trimmed(a, args.trim_top_db, args.keep_silence_ms) for a in audios]
+            return tokenizer_12hz.encode(waves, sr=24000)
+        return tokenizer_12hz.encode(audios)
+
     def encode_batch(batch_lines):
         """Encode a batch; if it fails, retry file by file and skip only the files that fail."""
         try:
-            enc_res = tokenizer_12hz.encode([line['audio'] for line in batch_lines])
+            enc_res = encode_audios([line['audio'] for line in batch_lines])
             results = list(zip(enc_res.audio_codes, batch_lines))
         except Exception as e:
             print(f"Batch encode failed ({type(e).__name__}); retrying file by file")
             results = []
             for line in batch_lines:
                 try:
-                    results.append((tokenizer_12hz.encode([line['audio']]).audio_codes[0], line))
+                    results.append((encode_audios([line['audio']]).audio_codes[0], line))
                 except Exception as e2:
                     print(f"Skipping {short(line['audio'])}: {type(e2).__name__}: {e2}")
         encoded = []

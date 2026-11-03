@@ -23,6 +23,7 @@ class _Tee:
 
     def write(self, data):
         self._stream.write(data)
+        self._stream.flush()  # under Slurm stdout is a file/pipe and would otherwise be block-buffered for minutes
         for part in data.splitlines(keepends=True):
             if self._at_line_start and part.strip():
                 self._file.write(datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] "))

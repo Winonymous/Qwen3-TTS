@@ -14,10 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import gc
 import json
 import os
 import random
 import shutil
+import traceback
 
 import torch
 import torch.nn.functional as F
@@ -174,7 +176,11 @@ def train():
                         help="Smoke test: train on a random subset of this many rows (0 = all). The validation "
                              "set is cut to --num_val_samples (default: a fifth of this, at least 1).")
     parser.add_argument("--num_val_samples", type=int, default=0,
-                        help="With --num_samples: number of validation rows to use")
+                        help="Use a random subset of this many validation rows (0 = all, or a fifth of "
+                             "--num_samples when that is set). A large validation set makes every evaluation slow.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes. Each sample loads and resamples its reference audio, "
+                             "which is slow in the main process.")
     parser.add_argument("--sample_seed", type=int, default=42, help="Seed for --num_samples")
     parser.add_argument("--max_codec_frames", type=int, default=0,
                         help="Drop train/val rows whose audio has more codec frames than this (0 = no limit). "
@@ -183,6 +189,19 @@ def train():
                         help="Drop train/val rows whose text has more characters than this (0 = no limit). "
                              "Batches are padded to their longest row, so one runaway transcript (for example a "
                              "repeated ASR hallucination) can use all the GPU memory.")
+    parser.add_argument("--sample_epochs", type=int, default=0,
+                        help="Every N epochs (and at the end if --max_steps stops the run), load the saved "
+                             "checkpoint like at inference and synthesize a few sentences into "
+                             "<output_model_path>/samples/epoch-N/ (also logged to wandb). 0 = off.")
+    parser.add_argument("--sample_file", type=str, default=None,
+                        help="Text file with one sentence per line to synthesize for every speaker. Default: the "
+                             "first --num_sample_texts validation rows of each (speaker, language) group.")
+    parser.add_argument("--sample_language", type=str, default=None,
+                        help="Language for --sample_file sentences (default: the training language)")
+    parser.add_argument("--num_sample_texts", type=int, default=2,
+                        help="Sentences per (speaker, language) group when --sample_file is not given")
+    parser.add_argument("--sample_max_new_tokens", type=int, default=300,
+                        help="Generation limit in codec frames (12.5 per second, so 300 = 24 s)")
     parser.add_argument("--no_initial_eval", action="store_true",
                         help="Skip the validation pass before training starts")
     parser.add_argument("--wandb_project", type=str, default=None,
@@ -251,15 +270,15 @@ def train():
                           f"val {len(val_data)}/{n_val} rows kept")
         if not train_data:
             raise SystemExit("No training rows left after --max_codec_frames")
-    if args.num_samples > 0:
+    if args.num_samples > 0 or args.num_val_samples > 0:
         rng = random.Random(args.sample_seed)
-        n_val = args.num_val_samples or max(1, args.num_samples // 5)
         n_train_all, n_val_all = len(train_data), len(val_data)
-        if len(train_data) > args.num_samples:
+        if args.num_samples > 0 and len(train_data) > args.num_samples:
             train_data = rng.sample(train_data, args.num_samples)
+        n_val = args.num_val_samples or max(1, args.num_samples // 5)
         if len(val_data) > n_val:
             val_data = rng.sample(val_data, n_val)
-        accelerator.print(f"--num_samples (smoke test): train {len(train_data)}/{n_train_all}, "
+        accelerator.print(f"Subsampling (--num_samples/--num_val_samples): train {len(train_data)}/{n_train_all}, "
                           f"val {len(val_data)}/{n_val_all} rows")
 
     # Speakers come from each row's `speaker` field (rows without one use --speaker_name). Names are lowercased
@@ -302,7 +321,8 @@ def train():
 
     dataset = TTSDataset(train_data, qwen3tts.processor, config, speaker2idx=speaker2idx,
                          default_speaker=args.speaker_name)
-    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
+    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn,
+                                  num_workers=args.num_workers, persistent_workers=args.num_workers > 0)
 
     val_dataloader = None
     if args.val_jsonl:
@@ -310,7 +330,8 @@ def train():
                                  default_speaker=args.speaker_name)
         val_dataloader = DataLoader(
             val_dataset, batch_size=args.val_batch_size or args.batch_size, shuffle=False,
-            collate_fn=val_dataset.collate_fn,
+            collate_fn=val_dataset.collate_fn, num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
         )
         accelerator.print(f"Validation: {len(val_data)} samples from {args.val_jsonl}")
 
@@ -371,6 +392,66 @@ def train():
         save_file(state_dict, save_path)
         accelerator.print(f"Saved {output_dir}")
 
+    # Sentences synthesized after each epoch: (speaker, language, text)
+    sample_items = []
+    if args.sample_epochs > 0:
+        if args.sample_file:
+            with open(args.sample_file, encoding="utf-8") as f:
+                sample_texts = [line.strip() for line in f if line.strip()]
+            real_languages = [lang for lang in languages if lang != "auto"]
+            sample_language = (args.sample_language or (real_languages[0] if real_languages else "auto")).lower()
+            sample_items = [(sp, sample_language, t) for sp in speakers for t in sample_texts]
+        else:
+            per_group = {}
+            for d in (val_data or train_data):
+                key = ((d.get("speaker") or args.speaker_name).lower(), (d.get("language") or "auto").lower())
+                if len(per_group.setdefault(key, [])) < args.num_sample_texts:
+                    per_group[key].append(d["text"])
+            sample_items = [(sp, lang, t) for (sp, lang), texts in sorted(per_group.items()) for t in texts]
+        accelerator.print(f"Sampling every {args.sample_epochs} epoch(s): {len(sample_items)} sentence(s)")
+
+    def _generate_samples(ckpt_name, tag):
+        import soundfile as sf
+
+        out_dir = os.path.join(args.output_model_path, "samples", tag)
+        os.makedirs(out_dir, exist_ok=True)
+        tts = None
+        try:
+            # Load the saved checkpoint exactly as inference does, so this also checks the checkpoint itself.
+            tts = Qwen3TTSModel.from_pretrained(
+                os.path.join(args.output_model_path, ckpt_name), device_map=str(accelerator.device),
+                dtype=torch.bfloat16, attn_implementation="flash_attention_2",
+            )
+            audio_logs = {}
+            with open(os.path.join(out_dir, "samples.tsv"), "w", encoding="utf-8") as manifest:
+                for k, (speaker, language, text) in enumerate(sample_items):
+                    wavs, sr = tts.generate_custom_voice(
+                        text=text, language=language, speaker=speaker,
+                        max_new_tokens=args.sample_max_new_tokens, do_sample=False,
+                    )
+                    name = f"{k:02d}_{speaker}_{language}"
+                    sf.write(os.path.join(out_dir, name + ".wav"), wavs[0], sr)
+                    manifest.write(f"{name}\t{text}\n")
+                    if wandb_run is not None:
+                        audio_logs[f"samples/{name}"] = wandb.Audio(wavs[0], sample_rate=sr, caption=text)
+            if audio_logs:
+                wandb_log(audio_logs, step=opt_step)
+            accelerator.print(f"Wrote {len(sample_items)} sample(s) to {out_dir}")
+        except Exception:  # a sampling problem must not kill a long training run
+            traceback.print_exc()
+            accelerator.print(f"Sampling failed for {ckpt_name}; training continues")
+        finally:
+            del tts
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def generate_samples(ckpt_name, tag):
+        if not sample_items:
+            return
+        if accelerator.is_main_process:
+            _generate_samples(ckpt_name, tag)
+        accelerator.wait_for_everyone()
+
     best_val = float("inf")
 
     def evaluate():
@@ -378,7 +459,9 @@ def train():
         model.eval()
         sums = torch.zeros(4, device=accelerator.device)
         with torch.no_grad():
-            for val_batch in val_dataloader:
+            for i, val_batch in enumerate(val_dataloader):
+                if i % 50 == 0:
+                    accelerator.print(f"  validation batch {i}/{len(val_dataloader)}")
                 loss, talker_loss, sub_talker_loss, _ = compute_losses(model, val_batch)
                 n = val_batch['input_ids'].shape[0]
                 sums += torch.tensor(
@@ -459,10 +542,14 @@ def train():
         if done:
             save_checkpoint(f"checkpoint-step-{opt_step}")
             run_eval(f"opt step {opt_step} (final)")
+            generate_samples(f"checkpoint-step-{opt_step}", f"step-{opt_step}")
             break
-        if (args.save_epochs > 0 and (epoch + 1) % args.save_epochs == 0) or epoch == num_epochs - 1:
+        sample_due = args.sample_epochs > 0 and (epoch + 1) % args.sample_epochs == 0
+        if (args.save_epochs > 0 and (epoch + 1) % args.save_epochs == 0) or epoch == num_epochs - 1 or sample_due:
             save_checkpoint(f"checkpoint-epoch-{epoch}")
         run_eval(f"end of epoch {epoch}")
+        if sample_due:
+            generate_samples(f"checkpoint-epoch-{epoch}", f"epoch-{epoch}")
 
     if wandb_run is not None:
         wandb_run.finish()
