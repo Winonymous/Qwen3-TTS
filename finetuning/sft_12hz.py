@@ -241,6 +241,15 @@ def train():
                         help="Language for --sample_file sentences (default: the training language)")
     parser.add_argument("--num_sample_texts", type=int, default=2,
                         help="Sentences per (speaker, language) group when --sample_file is not given")
+    parser.add_argument("--sample_batch_size", type=int, default=8,
+                        help="Sentences synthesized per generate call while sampling (they run in parallel in "
+                             "the batch; one call can mix speakers and languages)")
+    parser.add_argument("--sample_background", action="store_true",
+                        help="Synthesize the samples in a separate process (infer_12hz.py) so training goes on "
+                             "while they are generated. The audio is logged to wandb when the job has finished.")
+    parser.add_argument("--sample_gpu", type=str, default=None,
+                        help="With --sample_background: GPU id for the sampling process (default: the training "
+                             "GPU; a different GPU does not slow training down)")
     parser.add_argument("--sample_max_new_tokens", type=int, default=300,
                         help="Generation limit in codec frames (12.5 per second, so 300 = 24 s)")
     parser.add_argument("--no_initial_eval", action="store_true",
@@ -494,16 +503,20 @@ def train():
             )
             audio_logs = {}
             with open(os.path.join(out_dir, "samples.tsv"), "w", encoding="utf-8") as manifest:
-                for k, (speaker, language, text) in enumerate(sample_items):
+                # --sample_batch_size sentences per generate call (one call can mix speakers and languages)
+                for first in range(0, len(sample_items), args.sample_batch_size):
+                    batch = sample_items[first:first + args.sample_batch_size]
                     wavs, sr = tts.generate_custom_voice(
-                        text=text, language=language, speaker=speaker,
+                        text=[t for _, _, t in batch], language=[lang for _, lang, _ in batch],
+                        speaker=[spk for spk, _, _ in batch],
                         max_new_tokens=args.sample_max_new_tokens, do_sample=False,
                     )
-                    name = f"{k:02d}_{speaker}_{language}"
-                    sf.write(os.path.join(out_dir, name + ".wav"), wavs[0], sr)
-                    manifest.write(f"{name}\t{text}\n")
-                    if wandb_run is not None:
-                        audio_logs[f"samples/{name}"] = wandb.Audio(wavs[0], sample_rate=sr, caption=text)
+                    for j, ((speaker, language, text), wav) in enumerate(zip(batch, wavs)):
+                        name = f"{first + j:02d}_{speaker}_{language}"
+                        sf.write(os.path.join(out_dir, name + ".wav"), wav, sr)
+                        manifest.write(f"{name}\t{text}\n")
+                        if wandb_run is not None:
+                            audio_logs[f"samples/{name}"] = wandb.Audio(wav, sample_rate=sr, caption=text)
             if audio_logs:
                 wandb_log(audio_logs, step=opt_step)
             accelerator.print(f"Wrote {len(sample_items)} sample(s) to {out_dir}")
@@ -515,8 +528,74 @@ def train():
             gc.collect()
             torch.cuda.empty_cache()
 
+    pending_samples = []  # (process, tag, out_dir, log file) of background sampling jobs
+
+    def _launch_background_samples(ckpt_name, tag):
+        """Start infer_12hz.py on the saved checkpoint as a separate process; training does not wait for it."""
+        import subprocess
+        import sys
+
+        out_dir = os.path.join(args.output_model_path, "samples", tag)
+        os.makedirs(out_dir, exist_ok=True)
+        items_path = os.path.join(args.output_model_path, "samples", "items.tsv")
+        with open(items_path, "w", encoding="utf-8") as f:
+            f.write("id\tspeaker\tlanguage\ttext\n")
+            for k, (speaker, language, text) in enumerate(sample_items):
+                f.write(f"{k:02d}\t{speaker}\t{language}\t{' '.join(text.split())}\n")
+        gpu = args.sample_gpu if args.sample_gpu is not None else str(accelerator.device.index or 0)
+        cmd = [
+            sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "infer_12hz.py"),
+            "--checkpoint", os.path.join(args.output_model_path, ckpt_name), "--input", items_path,
+            "--output_dir", out_dir, "--text_column", "text", "--id_column", "id",
+            "--speaker_column", "speaker", "--language_column", "language",
+            "--batch_size", str(args.sample_batch_size), "--max_new_tokens", str(args.sample_max_new_tokens),
+            "--gpus", gpu,
+        ]
+        log = open(os.path.join(out_dir, "subprocess.out"), "w")
+        pending_samples.append((subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT), tag, out_dir, log))
+        accelerator.print(f"Sampling for {tag} started in the background on GPU {gpu}; wavs go to {out_dir}")
+
+    def collect_samples(wait=False):
+        """Report finished background sampling jobs and log their audio to wandb (wait=True: wait for all)."""
+        for entry in list(pending_samples):
+            proc, tag, out_dir, log = entry
+            if wait:
+                proc.wait()
+            if proc.poll() is None:
+                continue
+            pending_samples.remove(entry)
+            log.close()
+            if proc.returncode != 0:
+                accelerator.print(f"Background sampling for {tag} failed (exit code {proc.returncode}); "
+                                  f"see {os.path.join(out_dir, 'subprocess.out')}")
+                continue
+            accelerator.print(f"Background sampling for {tag} finished: {out_dir}")
+            if wandb_run is None:
+                continue
+            try:
+                import soundfile as sf
+
+                audio_logs = {}
+                with open(os.path.join(out_dir, "manifest.tsv"), encoding="utf-8") as f:
+                    next(f, None)  # header: id, speaker, language, status, seconds, path, text
+                    for line in f:
+                        fields = line.rstrip("\n").split("\t")
+                        if len(fields) >= 7 and fields[3] == "ok":
+                            wav, sr = sf.read(fields[5])
+                            audio_logs[f"samples/{fields[0]}_{fields[1]}_{fields[2]}"] = wandb.Audio(
+                                wav, sample_rate=sr, caption=f"{tag}: {fields[6]}")
+                if audio_logs:
+                    wandb_log(audio_logs, step=opt_step)  # logged at the step when the job finished
+            except Exception:
+                traceback.print_exc()
+
     def generate_samples(ckpt_name, tag):
         if not sample_items:
+            return
+        collect_samples()  # log background jobs that finished while training went on
+        if args.sample_background:
+            if accelerator.is_main_process:
+                _launch_background_samples(ckpt_name, tag)
             return
         if accelerator.is_main_process:
             _generate_samples(ckpt_name, tag)
@@ -662,6 +741,7 @@ def train():
         if sample_due:
             generate_samples(f"checkpoint-epoch-{epoch}", f"epoch-{epoch}")
 
+    collect_samples(wait=True)  # background sampling of the last checkpoint may still be running
     if wandb_run is not None:
         wandb_run.finish()
 
