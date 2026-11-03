@@ -24,6 +24,7 @@ from collections import defaultdict
 
 import librosa
 import soundfile as sf
+from audio_utils import normalize_loudness
 from logging_utils import setup_logging
 from qwen_tts import Qwen3TTSTokenizer
 from text_utils import normalize_text
@@ -71,6 +72,19 @@ def load_trimmed(path, top_db, keep_ms, sr=24000):
         return y
     keep = int(sr * keep_ms / 1000)
     return y[max(0, start - keep):min(len(y), end + keep)]
+
+
+def load_audio(path, args, sr=24000):
+    """Target audio as a mono waveform at `sr`, with the optional silence trimming and loudness normalization."""
+    if args.trim_silence:
+        y = load_trimmed(path, args.trim_top_db, args.keep_silence_ms, sr)
+    else:
+        if path.startswith("data:audio"):
+            path = io.BytesIO(base64.b64decode(path.split(",", 1)[1]))
+        y, _ = librosa.load(path, sr=sr, mono=True)
+    if args.normalize_loudness:
+        y = normalize_loudness(y, sr, args.target_db)  # after trimming, so the pauses do not count
+    return y
 
 
 def audio_duration(path):
@@ -139,6 +153,13 @@ def main():
                              "(lower = trims more)")
     parser.add_argument("--keep_silence_ms", type=int, default=100,
                         help="With --trim_silence: silence kept before and after the speech, in milliseconds")
+    parser.add_argument("--normalize_loudness", action="store_true",
+                        help="Bring every target clip to the same speech level (--target_db) before encoding. "
+                             "The model learns the loudness it is trained on, so quiet and loud clips in the "
+                             "data give quiet and loud generated speech.")
+    parser.add_argument("--target_db", type=float, default=-23.0,
+                        help="With --normalize_loudness: speech level in dBFS (RMS of the active speech). "
+                             "-23 is a comfortable level; the gain is limited so that clips do not clip")
     parser.add_argument("--max_text_chars", type=int, default=0,
                         help="Drop rows whose text has more characters than this (0 = no limit). Catches runaway "
                              "transcripts, e.g. a repeated ASR hallucination, which can use all the GPU memory.")
@@ -215,8 +236,8 @@ def main():
     # dataset.py resamples `ref_audio` to 24 kHz in memory when it is loaded for training.
 
     def encode_audios(audios):
-        if args.trim_silence:
-            waves = [load_trimmed(a, args.trim_top_db, args.keep_silence_ms) for a in audios]
+        if args.trim_silence or args.normalize_loudness:
+            waves = [load_audio(a, args) for a in audios]
             return tokenizer_12hz.encode(waves, sr=24000)
         return tokenizer_12hz.encode(audios)
 

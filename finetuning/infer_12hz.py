@@ -21,6 +21,7 @@ import os
 import re
 import time
 
+from audio_utils import normalize_loudness
 from logging_utils import setup_logging
 from text_utils import normalize_text
 
@@ -96,6 +97,8 @@ def run_worker(rank, gpu, items, args):
         )
         done = []
         for item, wav in zip(batch, wavs):
+            if args.normalize_loudness:
+                wav = normalize_loudness(wav, sr, args.target_db)
             sf.write(item["path"], wav, sr)
             done.append((item, "ok", len(wav) / sr))
         return done
@@ -168,6 +171,11 @@ def main():
                         help="Use the speaker named in this column for each row instead of crossing all speakers")
     parser.add_argument("--normalize_text", action="store_true",
                         help="Apply text_utils.normalize_text; use it if the model was trained with normalized text")
+    parser.add_argument("--normalize_loudness", action="store_true",
+                        help="Bring every generated clip to the same speech level (--target_db) before saving. "
+                             "Fixes models trained on quiet and loud clips without retraining.")
+    parser.add_argument("--target_db", type=float, default=-23.0,
+                        help="With --normalize_loudness: speech level in dBFS (RMS of the active speech)")
     parser.add_argument("--batch_size", type=int, default=8, help="Sentences per generate call, per worker")
     parser.add_argument("--gpus", type=str, default=None,
                         help="Comma-separated GPU ids (default: all visible GPUs)")
