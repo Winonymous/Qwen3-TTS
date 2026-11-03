@@ -121,6 +121,10 @@ def main():
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
+    parser.add_argument("--num_samples", type=int, default=0,
+                        help="Smoke test: encode only a random subset of this many rows (0 = all). It is taken "
+                             "after the filters and before the train/test split, so --test_ratio applies to the "
+                             "subset. Skips the slow encoding of the rest.")
     parser.add_argument("--no_normalize_text", dest="normalize_text", action="store_false",
                         help="Keep the text exactly as it is. By default it is normalized (Unicode NFC, invisible "
                              "characters removed, whitespace collapsed) so that the same word is always spelled "
@@ -202,6 +206,10 @@ def main():
         print(f"Duration filter (min {args.min_duration}s, max {args.max_duration}s): kept {len(kept)} of "
               f"{len(total_lines)} rows, dropped {len(total_lines) - len(kept)}")
         total_lines = kept
+
+    if args.num_samples > 0 and len(total_lines) > args.num_samples:
+        total_lines = random.Random(args.seed).sample(total_lines, args.num_samples)
+        print(f"--num_samples: using a random subset of {len(total_lines)} rows")
 
     # No audio is resampled or written here: the tokenizer resamples `audio` in memory when encoding, and
     # dataset.py resamples `ref_audio` to 24 kHz in memory when it is loaded for training.
