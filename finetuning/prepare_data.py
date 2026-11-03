@@ -104,6 +104,9 @@ def main():
     parser.add_argument("--test_jsonl", type=str, default=None,
                         help="Where the test split is written (default: <output_jsonl>_test.jsonl)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for the train/test split")
+    parser.add_argument("--max_text_chars", type=int, default=0,
+                        help="Drop rows whose text has more characters than this (0 = no limit). Catches runaway "
+                             "transcripts, e.g. a repeated ASR hallucination, which can use all the GPU memory.")
     parser.add_argument("--max_duration", type=float, default=0.0,
                         help="Drop rows whose target audio is longer than this many seconds (0 = no limit). "
                              "Very long clips use a lot of memory in training and tend to hurt it.")
@@ -137,6 +140,17 @@ def main():
         print(f"Skipping {len(bad_audio)} row(s) with unreadable audio (listed in {bad_path}); "
               f"first: {bad_audio[0]}")
         total_lines = [line for line, ok in zip(total_lines, readable) if ok]
+
+    if args.max_text_chars > 0:
+        long_rows = [line for line in total_lines if len(line['text']) > args.max_text_chars]
+        if long_rows:
+            long_path = args.output_jsonl + ".long_text.txt"
+            with open(long_path, 'w', encoding='utf-8') as f:
+                for line in long_rows:
+                    f.write(f"{len(line['text'])}\t{short(line['audio'])}\t{line['text'][:100]!r}\n")
+            print(f"Dropping {len(long_rows)} row(s) with more than {args.max_text_chars} characters of text "
+                  f"(listed in {long_path}); longest: {max(len(r['text']) for r in long_rows)} chars")
+            total_lines = [line for line in total_lines if len(line['text']) <= args.max_text_chars]
 
     if args.max_duration > 0 or args.min_duration > 0:
         kept = []

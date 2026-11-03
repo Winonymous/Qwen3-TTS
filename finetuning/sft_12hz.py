@@ -179,6 +179,10 @@ def train():
     parser.add_argument("--max_codec_frames", type=int, default=0,
                         help="Drop train/val rows whose audio has more codec frames than this (0 = no limit). "
                              "The codec runs at 12.5 frames per second, so 375 frames = 30 s.")
+    parser.add_argument("--max_text_chars", type=int, default=0,
+                        help="Drop train/val rows whose text has more characters than this (0 = no limit). "
+                             "Batches are padded to their longest row, so one runaway transcript (for example a "
+                             "repeated ASR hallucination) can use all the GPU memory.")
     parser.add_argument("--no_initial_eval", action="store_true",
                         help="Skip the validation pass before training starts")
     parser.add_argument("--wandb_project", type=str, default=None,
@@ -224,6 +228,21 @@ def train():
 
     train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
     val_data = [json.loads(line) for line in open(args.val_jsonl).readlines()] if args.val_jsonl else []
+    for name, rows in (("train", train_data), ("val", val_data)):
+        if rows:
+            texts = sorted(len(d["text"]) for d in rows)
+            frames = sorted(len(d["audio_codes"]) for d in rows)
+            accelerator.print(f"Length stats ({name}): text chars median {texts[len(texts) // 2]}, "
+                              f"longest {texts[-3:]}; codec frames median {frames[len(frames) // 2]}, "
+                              f"longest {frames[-3:]}")
+    if args.max_text_chars > 0:
+        n_train, n_val = len(train_data), len(val_data)
+        train_data = [d for d in train_data if len(d["text"]) <= args.max_text_chars]
+        val_data = [d for d in val_data if len(d["text"]) <= args.max_text_chars]
+        accelerator.print(f"--max_text_chars {args.max_text_chars}: train {len(train_data)}/{n_train}, "
+                          f"val {len(val_data)}/{n_val} rows kept")
+        if not train_data:
+            raise SystemExit("No training rows left after --max_text_chars")
     if args.max_codec_frames > 0:
         n_train, n_val = len(train_data), len(val_data)
         train_data = [d for d in train_data if len(d["audio_codes"]) <= args.max_codec_frames]

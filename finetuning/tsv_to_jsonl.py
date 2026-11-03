@@ -60,6 +60,9 @@ def main():
                         help="Language for every row, or only for rows with an empty --language_column cell "
                              "(default: none = Auto). A language the base model does not know is added during "
                              "fine-tuning. Use the same value as `language=` at inference.")
+    parser.add_argument("--max_text_chars", type=int, default=0,
+                        help="Skip rows whose text has more characters than this (0 = no limit). Catches runaway "
+                             "transcripts, e.g. a repeated ASR hallucination.")
     parser.add_argument("--check_audio", action="store_true",
                         help="Skip rows whose audio file does not exist")
     parser.add_argument("--log_file", type=str, default=None,
@@ -76,12 +79,16 @@ def main():
             parser.error(f"column(s) {missing} not found in {args.input_tsv} (columns: {columns})")
         has_ref_column = args.ref_audio_column in columns
 
-        rows, skipped = [], 0
+        rows, skipped, too_long = [], 0, []
         for row in reader:
             audio = row[args.audio_column].strip()
             text = row[args.text_column].strip()
             ref_audio = args.ref_path or (row[args.ref_audio_column].strip() if has_ref_column else "")
             if not audio or not text or (args.check_audio and not os.path.isfile(audio)):
+                skipped += 1
+                continue
+            if args.max_text_chars > 0 and len(text) > args.max_text_chars:
+                too_long.append((audio, len(text)))
                 skipped += 1
                 continue
             item = {"audio": audio, "text": text, "ref_audio": ref_audio}
@@ -108,6 +115,10 @@ def main():
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    if too_long:
+        print(f"Skipped {len(too_long)} row(s) with more than {args.max_text_chars} characters of text; "
+              f"longest: {max(n for _, n in too_long)} chars. First few: "
+              + ", ".join(f"{a} ({n})" for a, n in too_long[:5]))
     print(f"Wrote {len(rows)} rows to {args.output_jsonl} (skipped {skipped})")
 
 
