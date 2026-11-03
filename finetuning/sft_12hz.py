@@ -101,7 +101,8 @@ def compute_losses(model, batch):
     # the speaker slot sits right before the final codec_pad of the header; its index depends on whether
     # the sample has a language token
     speaker_pos = batch['speaker_pos'].to(input_ids.device)
-    input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = speaker_embedding
+    input_codec_embedding[torch.arange(input_ids.shape[0], device=input_ids.device), speaker_pos] = \
+        speaker_embedding.to(input_codec_embedding.dtype)
 
     input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -452,6 +453,13 @@ def train():
             _generate_samples(ckpt_name, tag)
         accelerator.wait_for_everyone()
 
+    def autocast_ctx():
+        # With fp32 master weights the forward must run under bf16 autocast: Flash Attention 2 only accepts
+        # fp16/bf16. compute_losses calls model.talker / model.speaker_encoder directly, which bypasses the
+        # autocast that accelerate puts around the top-level forward, so it is applied here. With bf16 weights
+        # nothing changes (disabled).
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.dtype == "float32")
+
     best_val = float("inf")
 
     def evaluate():
@@ -462,7 +470,8 @@ def train():
             for i, val_batch in enumerate(val_dataloader):
                 if i % 50 == 0:
                     accelerator.print(f"  validation batch {i}/{len(val_dataloader)}")
-                loss, talker_loss, sub_talker_loss, _ = compute_losses(model, val_batch)
+                with autocast_ctx():
+                    loss, talker_loss, sub_talker_loss, _ = compute_losses(model, val_batch)
                 n = val_batch['input_ids'].shape[0]
                 sums += torch.tensor(
                     [loss.item() * n, talker_loss.item() * n, sub_talker_loss.item() * n, n],
@@ -503,7 +512,8 @@ def train():
 
             with accelerator.accumulate(model):
 
-                loss, talker_loss, sub_talker_loss, speaker_embedding = compute_losses(model, batch)
+                with autocast_ctx():
+                    loss, talker_loss, sub_talker_loss, speaker_embedding = compute_losses(model, batch)
                 for emb, idx in zip(speaker_embedding.float(), batch['speaker_idx'].tolist()):
                     name = speakers[idx]
                     speaker_sum[name] = speaker_sum.get(name, 0) + emb
