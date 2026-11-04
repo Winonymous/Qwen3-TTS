@@ -78,11 +78,14 @@ def main():
     parser.add_argument("--min_seconds", type=float, default=None, help="Skip clips shorter than this")
     parser.add_argument("--max_seconds", type=float, default=None,
                         help="Skip clips longer than this (very long clips are what runs a small GPU out of memory)")
-    parser.add_argument("--max_rows", type=int, default=None, help="Only use the first N rows (for a quick test)")
+    parser.add_argument("--max_rows", type=int, default=None, help="Only use the first N rows that pass the filter (for a quick test; "
+                             "the first rows of a dataset are not random, prefer --num_samples)")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Random subset of this many usable rows (rows that are skipped are replaced by other "
                              "random rows until the amount is reached)")
     parser.add_argument("--sample_seed", type=int, default=42)
+    parser.add_argument("--num_proc", type=int, default=None,
+                        help="Processes for the filter (and the header scan) (default: 1)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
@@ -98,107 +101,108 @@ def main():
     if missing:
         parser.error(f"column(s) {missing} not found (columns: {ds.column_names})")
     ds = ds.cast_column(args.audio_column, Audio(decode=False))  # keep the original files / bytes untouched
-    if args.max_rows:
-        ds = ds.select(range(min(args.max_rows, len(ds))))
-    if len(ds):
-        first = ds[0]
-        audio = first[args.audio_column]
-        audio_info = ({"path": audio.get("path"), "bytes": len(audio["bytes"]) if audio.get("bytes") else None}
-                      if isinstance(audio, dict) else audio)
-        print(f"First row: audio={audio_info}, text={first[args.text_column]!r}")
+    if len(ds):  # text only: reading the audio cell would load the whole first clip into memory
+        first_text = ds[args.text_column][0]
+        print(f"First row text ({len(first_text or '')} characters): {(first_text or '')[:200]!r}")
 
     skipped = Counter()
     skip_examples = defaultdict(list)  # reason -> first few (row index, detail)
 
-    def skip(reason, i, detail=""):
-        skipped[reason] += 1
-        if len(skip_examples[reason]) < 5:
-            skip_examples[reason].append((i, detail))
+    # Duration of every clip: the column if there is one, otherwise read from each file's header (into a small
+    # extra column; the audio itself is never copied).
+    if args.duration_column:
+        duration_col = args.duration_column
+    else:
+        duration_col = "_duration"
+        header_ds = ds.select_columns([args.audio_column]).map(
+            lambda audio: {duration_col: clip_duration(audio)[0]}, input_columns=[args.audio_column],
+            remove_columns=[args.audio_column], num_proc=args.num_proc, desc="Reading durations from the audio headers")
+        ds = ds.add_column(duration_col, header_ds[duration_col])
 
-    # The metadata columns are read as plain lists; audio is only fetched through `get_audio`, row by row.
-    texts = ds[args.text_column]
-    speaker_cells = ds[args.speaker_column] if args.speaker_column else None
-    language_cells = ds[args.language_column] if args.language_column else None
-    col_durations = ds[args.duration_column] if args.duration_column else None
-    audio_ds = ds.select_columns([args.audio_column])
+    def reason(text, duration):
+        """Why a row is dropped, or None if it passes."""
+        if not (isinstance(text, str) and text.strip()):
+            return "empty text"
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            duration = float("nan")
+        if duration != duration or duration <= 0:
+            return "duration column is not a number" if args.duration_column else "unreadable audio"
+        if args.min_seconds and duration < args.min_seconds:
+            return f"shorter than --min_seconds {args.min_seconds}"
+        if args.max_seconds and duration > args.max_seconds:
+            return f"longer than --max_seconds {args.max_seconds}"
+        return None
 
-    def get_audio(i):
-        return audio_ds[i][args.audio_column]
+    # Stage 1: FILTER every row with Dataset.filter. Only the text and duration columns are read, so no audio is
+    # loaded. Nothing is sampled yet.
+    all_texts, all_durations = ds[args.text_column], ds[duration_col]
+    for i, (t, d) in enumerate(zip(all_texts, all_durations)):  # skip summary: which rule drops how many rows
+        why = reason(t, d)
+        if why:
+            skipped[why] += 1
+            if len(skip_examples[why]) < 5:
+                skip_examples[why].append((i, f"text={(t or '')[:40]!r}, duration={d!r}"))
+    filtered = ds.filter(lambda t, d: reason(t, d) is None, input_columns=[args.text_column, duration_col],
+                         num_proc=args.num_proc, desc="Filtering rows")
+    print(f"Filter: {len(filtered)} of {len(ds)} rows pass, {sum(skipped.values())} skipped")
+    good = sorted(d for d in all_durations if isinstance(d, (int, float)) and d == d and d > 0)
+    if good:
+        print(f"Clip durations (all rows): min {good[0]:.2f}s, median {good[len(good) // 2]:.2f}s, "
+              f"max {good[-1]:.2f}s ({len(good)} clips)")
+    for why, count in skipped.most_common():
+        print(f"  skipped {count} rows: {why}")
+        for i, detail in skip_examples[why]:
+            print(f"      e.g. row {i}: {detail}")
+    if not len(filtered):
+        raise SystemExit("No usable rows (wrong --text_column / --audio_column / --duration_column, audio files not "
+                         "found on this machine, or --min_seconds / --max_seconds too strict?).")
+    if args.max_rows:  # applied to the rows that passed the filter, not to the raw dataset
+        filtered = filtered.select(range(min(args.max_rows, len(filtered))))
+
+    # Stage 2: SAMPLE from the rows that passed, with Dataset.shuffle(seed). A drawn row whose audio turns out to be
+    # missing is replaced by the next one in the shuffled order, so the sample still reaches --num_samples.
+    if args.num_samples:
+        filtered = filtered.shuffle(seed=args.sample_seed)
+    audio_ds = filtered.select_columns([args.audio_column])
+
+    def get_audio(pos):
+        return audio_ds[pos][args.audio_column]
 
     def has_audio(audio):
         return isinstance(audio, dict) and bool((audio.get("path") and os.path.isfile(audio["path"]))
                                                 or audio.get("bytes"))
 
-    # Stage 1: FILTER every row (empty text, duration limits, unreadable audio). Nothing is sampled yet.
-    # With --duration_column this only looks at the metadata columns; without it each clip's header is read.
-    pool, durations = [], []
-    for i in range(len(ds)):
-        text = texts[i].strip() if isinstance(texts[i], str) else ""
-        if not text:
-            skip("empty text", i, f"cell={texts[i]!r}")
-            continue
-        if col_durations is not None:
-            try:
-                duration = float(col_durations[i])
-            except (TypeError, ValueError):
-                skip("duration column is not a number", i, f"cell={col_durations[i]!r}")
-                continue
-        else:
-            duration, why = clip_duration(get_audio(i))
-            if duration is None:
-                skip("unreadable audio", i, why)
-                continue
-        durations.append(duration)
-        if args.min_seconds and duration < args.min_seconds:
-            skip(f"shorter than --min_seconds {args.min_seconds}", i, f"{duration:.2f}s")
-            continue
-        if args.max_seconds and duration > args.max_seconds:
-            skip(f"longer than --max_seconds {args.max_seconds}", i, f"{duration:.2f}s")
-            continue
-        speaker = (str(speaker_cells[i] or "").strip() if speaker_cells else "") or args.speaker
-        language = (str(language_cells[i] or "").strip() if language_cells else "") or args.language
-        pool.append({"idx": i, "text": text, "speaker": speaker, "language": language, "duration": duration})
-        if (i + 1) % 5000 == 0:
-            print(f"  filtered {i + 1}/{len(ds)} rows: {len(pool)} pass, {sum(skipped.values())} skipped", flush=True)
-
-    print(f"Filter: {len(pool)} of {len(ds)} rows pass, {sum(skipped.values())} skipped")
-    if durations:
-        durations.sort()
-        print(f"Clip durations: min {durations[0]:.2f}s, median {durations[len(durations) // 2]:.2f}s, "
-              f"max {durations[-1]:.2f}s ({len(durations)} clips)")
-    if not pool:
-        for reason, count in skipped.most_common():
-            print(f"  skipped {count} rows: {reason}")
-            for i, detail in skip_examples[reason]:
-                print(f"      e.g. row {i}: {detail}")
-        raise SystemExit("No usable rows (wrong --text_column / --audio_column, audio files not found on this "
-                         "machine, or --min_seconds / --max_seconds too strict?).")
-
-    # Stage 2: SAMPLE from the rows that passed. A drawn row whose audio turns out to be missing is replaced by the
-    # next random one, so the sample still reaches --num_samples.
-    if args.num_samples:
-        random.Random(args.sample_seed).shuffle(pool)
-    wanted = args.num_samples or len(pool)
-    if col_durations is None:  # the header scan already proved that the audio is readable
-        rows = pool[:wanted]
-    else:
-        rows = []
-        for r in pool:
-            if len(rows) >= wanted:
+    wanted = args.num_samples or len(filtered)
+    positions = []
+    if args.num_samples and args.duration_column:  # without a duration column the header scan proved the audio
+        for pos in range(len(filtered)):
+            if len(positions) >= wanted:
                 break
-            if has_audio(get_audio(r["idx"])):
-                rows.append(r)
+            if has_audio(get_audio(pos)):
+                positions.append(pos)
             else:
-                skip("no audio file or bytes", r["idx"])
-    if args.num_samples and len(rows) < args.num_samples:
-        print(f"Warning: only {len(rows)} usable rows exist, fewer than --num_samples {args.num_samples}")
-    print(f"Selected {len(rows)} rows" + (f" (random sample, seed {args.sample_seed})" if args.num_samples else ""))
-    for reason, count in skipped.most_common():
-        print(f"  skipped {count} rows: {reason}")
-        for i, detail in skip_examples[reason]:
-            print(f"      e.g. row {i}: {detail}" if detail else f"      e.g. row {i}")
-    if not rows:
+                skipped["no audio file or bytes"] += 1
+    else:
+        positions = list(range(min(wanted, len(filtered))))
+    if args.num_samples and len(positions) < args.num_samples:
+        print(f"Warning: only {len(positions)} usable rows exist, fewer than --num_samples {args.num_samples}")
+    print(f"Selected {len(positions)} rows" + (f" (random sample, seed {args.sample_seed})" if args.num_samples else ""))
+    if not positions:
         raise SystemExit("No usable rows: none of the rows that passed the filter has audio.")
+
+    texts = filtered[args.text_column]
+    speaker_cells = filtered[args.speaker_column] if args.speaker_column else None
+    language_cells = filtered[args.language_column] if args.language_column else None
+    durations = filtered[duration_col]
+    rows = []
+    for pos in positions:
+        rows.append({
+            "pos": pos, "text": texts[pos].strip(), "duration": float(durations[pos]),
+            "speaker": (str(speaker_cells[pos] or "").strip() if speaker_cells else "") or args.speaker,
+            "language": (str(language_cells[pos] or "").strip() if language_cells else "") or args.language,
+        })
 
     # One fixed reference clip per speaker: the median-length one (a typical clip, not an outlier).
     by_speaker = defaultdict(list)
@@ -208,17 +212,16 @@ def main():
     for spk, group in by_speaker.items():
         group.sort(key=lambda r: r["duration"])
         ref = group[(len(group) - 1) // 2]
-        ref_src[spk] = clip_source(get_audio(ref["idx"]))
-        print(f"Reference for speaker {spk or '(none)'!r}: row {ref['idx']} ({ref['duration']:.2f}s, "
-              f"median of {len(group)} clips)")
+        ref_src[spk] = clip_source(get_audio(ref["pos"]))
+        print(f"Reference for speaker {spk or '(none)'!r}: {ref['duration']:.2f}s, median of {len(group)} clips")
 
-    # Stage 3: write, grouped by speaker (then dataset order) so each speaker's rows are contiguous in the file.
-    n = 0
+    # Stage 3: write, grouped by speaker (then in the order they were selected) so each speaker's rows are contiguous.
+    n, no_source = 0, 0
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
-        for r in sorted(rows, key=lambda r: (r["speaker"] or "", r["idx"])):
-            audio = clip_source(get_audio(r["idx"]))
+        for r in sorted(rows, key=lambda r: (r["speaker"] or "", r["pos"])):
+            audio = clip_source(get_audio(r["pos"]))
             if audio is None:
-                skip("no audio file or bytes (at write time)", r["idx"])
+                no_source += 1
                 continue
             item = {"audio": audio, "text": r["text"], "ref_audio": ref_src[r["speaker"] or ""]}
             if r["speaker"]:
@@ -227,7 +230,8 @@ def main():
                 item["language"] = r["language"]
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
             n += 1
-    print(f"Wrote {n} rows to {args.output_jsonl} (skipped {sum(skipped.values())})")
+    print(f"Wrote {n} rows to {args.output_jsonl} (dropped by the filter: {sum(skipped.values())}, "
+          f"no audio at write time: {no_source})")
 
 
 if __name__ == "__main__":
