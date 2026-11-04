@@ -20,10 +20,12 @@ import base64
 import io
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import soundfile as sf
 from datasets import Audio, load_dataset
+
+from logging_utils import setup_logging
 
 
 def clip_source(audio):
@@ -37,13 +39,17 @@ def clip_source(audio):
 
 
 def clip_duration(audio):
-    """Duration in seconds from the file header only (nothing is decoded), or None if unreadable."""
+    """(duration in seconds, None) from the file header only (nothing is decoded), or (None, why) if unreadable."""
+    if not isinstance(audio, dict):
+        return None, f"audio cell is {type(audio).__name__}, not a dict (None = missing audio)"
     path, data = audio.get("path"), audio.get("bytes")
+    if not (path and os.path.isfile(path)) and not data:
+        return None, f"no file on disk (path={path!r}) and no bytes"
     try:
         info = sf.info(path if path and os.path.isfile(path) else io.BytesIO(data))
-        return info.frames / info.samplerate
-    except Exception:
-        return None
+        return info.frames / info.samplerate, None
+    except Exception as e:
+        return None, f"soundfile cannot read it: {type(e).__name__}: {e} (path={path!r}, bytes={len(data) if data else 0})"
 
 
 def main():
@@ -68,9 +74,15 @@ def main():
     parser.add_argument("--max_seconds", type=float, default=None,
                         help="Skip clips longer than this (very long clips are what runs a small GPU out of memory)")
     parser.add_argument("--max_rows", type=int, default=None, help="Only use the first N rows (for a quick test)")
+    parser.add_argument("--log_file", type=str, default=None,
+                        help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
+    setup_logging(args.log_file or args.output_jsonl + ".log", args)
 
     ds = load_dataset(args.dataset, args.config, split=args.split, cache_dir=args.cache_dir)
+    print(f"Loaded {args.dataset!r} config={args.config!r} split={args.split!r}: {len(ds)} rows")
+    print(f"Columns: {ds.column_names}")
+    print(f"Features: {ds.features}")
     missing = [c for c in (args.audio_column, args.text_column, args.speaker_column, args.language_column)
                if c is not None and c not in ds.column_names]
     if missing:
@@ -78,20 +90,58 @@ def main():
     ds = ds.cast_column(args.audio_column, Audio(decode=False))  # keep the original files / bytes untouched
     if args.max_rows:
         ds = ds.select(range(min(args.max_rows, len(ds))))
+    if len(ds):
+        first = ds[0]
+        audio = first[args.audio_column]
+        audio_info = ({"path": audio.get("path"), "bytes": len(audio["bytes"]) if audio.get("bytes") else None}
+                      if isinstance(audio, dict) else audio)
+        print(f"First row: audio={audio_info}, text={first[args.text_column]!r}")
 
     # Pass 1: header-only scan -> which rows are usable, and each speaker's clip durations.
-    rows, skipped = [], 0
+    rows, skipped = [], Counter()
+    skip_examples = defaultdict(list)  # reason -> first few (row index, detail)
+
+    def skip(reason, i, detail=""):
+        skipped[reason] += 1
+        if len(skip_examples[reason]) < 5:
+            skip_examples[reason].append((i, detail))
+
+    durations = []
     for i, row in enumerate(ds):
-        text = (row[args.text_column] or "").strip()
-        duration = clip_duration(row[args.audio_column]) if text else None
-        if (duration is None
-                or (args.min_seconds and duration < args.min_seconds)
-                or (args.max_seconds and duration > args.max_seconds)):
-            skipped += 1
+        text = row[args.text_column]
+        text = text.strip() if isinstance(text, str) else ""
+        if not text:
+            skip("empty text", i, f"cell={row[args.text_column]!r}")
+            continue
+        duration, why = clip_duration(row[args.audio_column])
+        if duration is None:
+            skip("unreadable audio", i, why)
+            continue
+        durations.append(duration)
+        if args.min_seconds and duration < args.min_seconds:
+            skip(f"shorter than --min_seconds {args.min_seconds}", i, f"{duration:.2f}s")
+            continue
+        if args.max_seconds and duration > args.max_seconds:
+            skip(f"longer than --max_seconds {args.max_seconds}", i, f"{duration:.2f}s")
             continue
         speaker = (str(row[args.speaker_column] or "").strip() if args.speaker_column else "") or args.speaker
         language = (str(row[args.language_column] or "").strip() if args.language_column else "") or args.language
         rows.append({"idx": i, "text": text, "speaker": speaker, "language": language, "duration": duration})
+        if (i + 1) % 5000 == 0:
+            print(f"  scanned {i + 1}/{len(ds)} rows: {len(rows)} usable, {sum(skipped.values())} skipped", flush=True)
+
+    print(f"Scan: {len(rows)} usable, {sum(skipped.values())} skipped of {len(ds)} rows")
+    if durations:
+        durations.sort()
+        print(f"Readable clip durations: min {durations[0]:.2f}s, median {durations[len(durations) // 2]:.2f}s, "
+              f"max {durations[-1]:.2f}s ({len(durations)} clips)")
+    for reason, count in skipped.most_common():
+        print(f"  skipped {count} rows: {reason}")
+        for i, detail in skip_examples[reason]:
+            print(f"      e.g. row {i}: {detail}")
+    if not rows:
+        raise SystemExit("No usable rows. See the skip reasons above (wrong --text_column / --audio_column, audio "
+                         "files not found on this machine, or --min_seconds / --max_seconds too strict?).")
 
     # One fixed reference clip per speaker: the median-length one (a typical clip, not an outlier).
     by_speaker = defaultdict(list)
@@ -112,11 +162,13 @@ def main():
     for i, row in enumerate(ds):
         if i in ref_rows:
             ref_src[i] = clip_source(row[args.audio_column])
-    n = 0
+    n, no_source = 0, 0
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
         for i, row in enumerate(ds):
             r = keep.get(i)
             audio = clip_source(row[args.audio_column]) if r else None
+            if r is not None and audio is None:
+                no_source += 1
             if r is None or audio is None:
                 continue
             item = {"audio": audio, "text": r["text"], "ref_audio": ref_src[ref_idx[r["speaker"] or ""]]}
@@ -126,7 +178,7 @@ def main():
                 item["language"] = r["language"]
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
             n += 1
-    print(f"Wrote {n} rows to {args.output_jsonl} (skipped {skipped})")
+    print(f"Wrote {n} rows to {args.output_jsonl} (skipped {sum(skipped.values()) + no_source})")
 
 
 if __name__ == "__main__":
