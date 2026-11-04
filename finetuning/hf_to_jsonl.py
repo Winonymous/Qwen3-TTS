@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import os
+import random
 from collections import Counter, defaultdict
 
 import soundfile as sf
@@ -74,6 +75,10 @@ def main():
     parser.add_argument("--max_seconds", type=float, default=None,
                         help="Skip clips longer than this (very long clips are what runs a small GPU out of memory)")
     parser.add_argument("--max_rows", type=int, default=None, help="Only use the first N rows (for a quick test)")
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Random subset of this many usable rows (rows that are skipped are replaced by other "
+                             "random rows until the amount is reached)")
+    parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--log_file", type=str, default=None,
                         help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
@@ -106,8 +111,17 @@ def main():
         if len(skip_examples[reason]) < 5:
             skip_examples[reason].append((i, detail))
 
-    durations = []
-    for i, row in enumerate(ds):
+    # With --num_samples the rows are visited in random order and the scan stops as soon as that many usable rows
+    # are found, so skipped rows are replaced by other random ones instead of shrinking the sample.
+    order = list(range(len(ds)))
+    if args.num_samples:
+        random.Random(args.sample_seed).shuffle(order)
+    durations, scanned = [], 0
+    for i in order:
+        if args.num_samples and len(rows) >= args.num_samples:
+            break
+        scanned += 1
+        row = ds[i]
         text = row[args.text_column]
         text = text.strip() if isinstance(text, str) else ""
         if not text:
@@ -127,10 +141,12 @@ def main():
         speaker = (str(row[args.speaker_column] or "").strip() if args.speaker_column else "") or args.speaker
         language = (str(row[args.language_column] or "").strip() if args.language_column else "") or args.language
         rows.append({"idx": i, "text": text, "speaker": speaker, "language": language, "duration": duration})
-        if (i + 1) % 5000 == 0:
-            print(f"  scanned {i + 1}/{len(ds)} rows: {len(rows)} usable, {sum(skipped.values())} skipped", flush=True)
+        if scanned % 5000 == 0:
+            print(f"  scanned {scanned}/{len(ds)} rows: {len(rows)} usable, {sum(skipped.values())} skipped", flush=True)
 
-    print(f"Scan: {len(rows)} usable, {sum(skipped.values())} skipped of {len(ds)} rows")
+    print(f"Scan: {len(rows)} usable, {sum(skipped.values())} skipped of {scanned} rows looked at ({len(ds)} in the dataset)")
+    if args.num_samples and len(rows) < args.num_samples:
+        print(f"Warning: only {len(rows)} usable rows exist, fewer than --num_samples {args.num_samples}")
     if durations:
         durations.sort()
         print(f"Readable clip durations: min {durations[0]:.2f}s, median {durations[len(durations) // 2]:.2f}s, "
@@ -158,18 +174,14 @@ def main():
     # Pass 2: write the rows; each reference is read once and reused.
     keep = {r["idx"]: r for r in rows}
     ref_rows = set(ref_idx.values())
-    ref_src = {}
-    for i, row in enumerate(ds):
-        if i in ref_rows:
-            ref_src[i] = clip_source(row[args.audio_column])
+    ref_src = {i: clip_source(ds[i][args.audio_column]) for i in sorted(ref_rows)}
     n, no_source = 0, 0
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
-        for i, row in enumerate(ds):
-            r = keep.get(i)
-            audio = clip_source(row[args.audio_column]) if r else None
-            if r is not None and audio is None:
+        for i in sorted(keep):
+            r = keep[i]
+            audio = clip_source(ds[i][args.audio_column])
+            if audio is None:
                 no_source += 1
-            if r is None or audio is None:
                 continue
             item = {"audio": audio, "text": r["text"], "ref_audio": ref_src[ref_idx[r["speaker"] or ""]]}
             if r["speaker"]:
