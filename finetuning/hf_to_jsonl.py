@@ -119,10 +119,8 @@ def main():
             remove_columns=[args.audio_column], num_proc=args.num_proc, desc="Reading durations from the audio headers")
         ds = ds.add_column(duration_col, header_ds[duration_col])
 
-    def reason(text, duration):
-        """Why a row is dropped, or None if it passes."""
-        if not (isinstance(text, str) and text.strip()):
-            return "empty text"
+    def duration_reason(duration):
+        """Why a clip is dropped on its duration alone, or None if it passes."""
         try:
             duration = float(duration)
         except (TypeError, ValueError):
@@ -135,17 +133,27 @@ def main():
             return f"longer than --max_seconds {args.max_seconds}"
         return None
 
-    # Stage 1: FILTER every row with Dataset.filter. Only the text and duration columns are read, so no audio is
-    # loaded. Nothing is sampled yet.
-    all_texts, all_durations = ds[args.text_column], ds[duration_col]
-    for i, (t, d) in enumerate(zip(all_texts, all_durations)):  # skip summary: which rule drops how many rows
-        why = reason(t, d)
+    def has_text(text):
+        return isinstance(text, str) and bool(text.strip())
+
+    # Stage 1: FILTER every row with Dataset.filter, cheapest column first. The duration filter reads only the small
+    # duration column; the text column (transcripts can be thousands of characters) is only read for the rows that
+    # survive it, and the audio is never loaded. Nothing is sampled yet.
+    print(f"Filtering {len(ds)} rows on {duration_col!r} ...", flush=True)
+    all_durations = ds[duration_col]
+    for i, d in enumerate(all_durations):  # skip summary: which rule drops how many rows
+        why = duration_reason(d)
         if why:
             skipped[why] += 1
             if len(skip_examples[why]) < 5:
-                skip_examples[why].append((i, f"text={(t or '')[:40]!r}, duration={d!r}"))
-    filtered = ds.filter(lambda t, d: reason(t, d) is None, input_columns=[args.text_column, duration_col],
-                         num_proc=args.num_proc, desc="Filtering rows")
+                skip_examples[why].append((i, f"duration={d!r}"))
+    short_enough = ds.filter(lambda d: duration_reason(d) is None, input_columns=[duration_col],
+                             num_proc=args.num_proc, desc="Filtering on duration")
+    print(f"Duration filter: {len(short_enough)} of {len(ds)} rows pass; checking the text of those ...", flush=True)
+    filtered = short_enough.filter(has_text, input_columns=[args.text_column], num_proc=args.num_proc,
+                                   desc="Filtering empty text")
+    if len(short_enough) != len(filtered):
+        skipped["empty text"] += len(short_enough) - len(filtered)
     print(f"Filter: {len(filtered)} of {len(ds)} rows pass, {sum(skipped.values())} skipped")
     good = sorted(d for d in all_durations if isinstance(d, (int, float)) and d == d and d > 0)
     if good:
