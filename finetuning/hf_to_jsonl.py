@@ -71,6 +71,10 @@ def main():
     parser.add_argument("--language", type=str, default=None,
                         help="Language for every row, or only for rows with an empty --language_column cell "
                              "(default: none = Auto). Use the same value as `language=` at inference.")
+    parser.add_argument("--duration_column", type=str, default=None,
+                        help="Column with each clip's duration in seconds. The --min_seconds / --max_seconds filter "
+                             "is then applied to it first (fast, no audio is opened) and --num_samples draws only "
+                             "from the rows that pass")
     parser.add_argument("--min_seconds", type=float, default=None, help="Skip clips shorter than this")
     parser.add_argument("--max_seconds", type=float, default=None,
                         help="Skip clips longer than this (very long clips are what runs a small GPU out of memory)")
@@ -88,7 +92,8 @@ def main():
     print(f"Loaded {args.dataset!r} config={args.config!r} split={args.split!r}: {len(ds)} rows")
     print(f"Columns: {ds.column_names}")
     print(f"Features: {ds.features}")
-    missing = [c for c in (args.audio_column, args.text_column, args.speaker_column, args.language_column)
+    missing = [c for c in (args.audio_column, args.text_column, args.speaker_column, args.language_column,
+                           args.duration_column)
                if c is not None and c not in ds.column_names]
     if missing:
         parser.error(f"column(s) {missing} not found (columns: {ds.column_names})")
@@ -113,7 +118,27 @@ def main():
 
     # With --num_samples the rows are visited in random order and the scan stops as soon as that many usable rows
     # are found, so skipped rows are replaced by other random ones instead of shrinking the sample.
+    # With --duration_column the duration filter runs first, on the column alone (no audio is opened), so the
+    # sample is drawn only from rows that pass it.
+    col_durations = None
     order = list(range(len(ds)))
+    if args.duration_column:
+        col_durations = ds[args.duration_column]
+        order = []
+        for i, d in enumerate(col_durations):
+            try:
+                d = float(d)
+            except (TypeError, ValueError):
+                skip("duration column is not a number", i, f"cell={d!r}")
+                continue
+            if args.min_seconds and d < args.min_seconds:
+                skip(f"shorter than --min_seconds {args.min_seconds}", i, f"{d:.2f}s")
+            elif args.max_seconds and d > args.max_seconds:
+                skip(f"longer than --max_seconds {args.max_seconds}", i, f"{d:.2f}s")
+            else:
+                order.append(i)
+                col_durations[i] = d
+        print(f"Duration filter ({args.duration_column!r}): {len(order)} of {len(ds)} rows pass")
     if args.num_samples:
         random.Random(args.sample_seed).shuffle(order)
     durations, scanned = [], 0
@@ -127,7 +152,13 @@ def main():
         if not text:
             skip("empty text", i, f"cell={row[args.text_column]!r}")
             continue
-        duration, why = clip_duration(row[args.audio_column])
+        if col_durations is not None:
+            audio = row[args.audio_column]
+            has_audio = isinstance(audio, dict) and ((audio.get("path") and os.path.isfile(audio["path"]))
+                                                     or audio.get("bytes"))
+            duration, why = (col_durations[i], None) if has_audio else (None, f"no audio file or bytes: {audio!r:.200}")
+        else:
+            duration, why = clip_duration(row[args.audio_column])
         if duration is None:
             skip("unreadable audio", i, why)
             continue
@@ -177,7 +208,8 @@ def main():
     ref_src = {i: clip_source(ds[i][args.audio_column]) for i in sorted(ref_rows)}
     n, no_source = 0, 0
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
-        for i in sorted(keep):
+        # Grouped by speaker (then dataset order), so each speaker's rows are contiguous in the file.
+        for i in sorted(keep, key=lambda i: (keep[i]["speaker"] or "", i)):
             r = keep[i]
             audio = clip_source(ds[i][args.audio_column])
             if audio is None:

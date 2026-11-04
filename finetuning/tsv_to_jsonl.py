@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import os
+import random
 
 from logging_utils import setup_logging
 from text_utils import normalize_text
@@ -71,6 +72,9 @@ def main():
                              "transcripts, e.g. a repeated ASR hallucination.")
     parser.add_argument("--check_audio", action="store_true",
                         help="Skip rows whose audio file does not exist")
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Random subset of this many usable rows (skipped rows never count towards it)")
+    parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--log_file", type=str, default=None,
                         help="Everything printed is also written here (default: <output_jsonl>.log)")
     args = parser.parse_args()
@@ -109,6 +113,13 @@ def main():
             if language:
                 item["language"] = language
             rows.append(item)
+
+    # Sampling happens after the filters above, so skipped rows never count towards the amount.
+    if args.num_samples and len(rows) > args.num_samples:
+        print(f"Sampling {args.num_samples} of {len(rows)} usable rows")
+        rows = random.Random(args.sample_seed).sample(rows, args.num_samples)
+    elif args.num_samples:
+        print(f"Warning: only {len(rows)} usable rows exist, fewer than --num_samples {args.num_samples}")
 
     # Rows without a reference share the median-length clip of their speaker (of the whole dataset if there are
     # no speakers).
