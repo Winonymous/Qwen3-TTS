@@ -22,7 +22,7 @@ import multiprocessing as mp
 import os
 import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import librosa
@@ -100,6 +100,14 @@ def audio_duration(path):
         return info.frames / info.samplerate
     except Exception:
         return None
+
+
+def audio_check(path):
+    """(readable, duration in seconds or None) from a single open of the file (`path` may be a data: URL)."""
+    duration = audio_duration(path)
+    if duration is not None and duration > 0:
+        return True, duration
+    return audio_is_readable(path), None  # e.g. a format soundfile cannot open but librosa can
 
 
 def split_rows(rows, test_ratio, seed):
@@ -257,56 +265,80 @@ def main():
         devices = [f"cuda:{g}" for g in gpus for _ in range(args.procs_per_gpu)]
     print(f"Encoding workers: {devices}")
 
+    print(f"Reading {args.input_jsonl} ...", flush=True)
     with open(args.input_jsonl, encoding='utf-8') as f:
-        total_lines = [json.loads(line) for line in f if line.strip()]
+        all_rows = [json.loads(line) for line in f if line.strip()]
+    print(f"Read {len(all_rows)} rows", flush=True)
 
-    # Drop rows whose audio cannot be read: one corrupt file would otherwise abort the whole encoding run.
-    with ThreadPoolExecutor(args.num_threads) as pool:
-        readable = list(pool.map(audio_is_readable, [line['audio'] for line in total_lines]))
-    bad_audio = [short(line['audio']) for line, ok in zip(total_lines, readable) if not ok]
+    stats = Counter()
+    bad_audio, long_rows = [], []
+
+    def filter_rows(rows):
+        """Apply the text, readability and duration filters to `rows`; returns the rows that pass."""
+        kept = []
+        for line in rows:  # cheap checks first: they need no file access
+            if args.normalize_text:
+                clean = normalize_text(line['text'])
+                stats['text_changed'] += clean != line['text']
+                line['text'] = clean
+            if args.max_text_chars > 0 and len(line['text']) > args.max_text_chars:
+                long_rows.append(line)
+                continue
+            kept.append(line)
+        # One open of each file gives both "can it be read" (one corrupt file would abort the whole encoding run)
+        # and its duration.
+        with ThreadPoolExecutor(args.num_threads) as pool:
+            checks = list(pool.map(audio_check, [line['audio'] for line in kept]))
+        passed = []
+        for line, (ok, d) in zip(kept, checks):
+            if not ok:
+                bad_audio.append(short(line['audio']))
+            elif args.max_duration > 0 and d is not None and d > args.max_duration:
+                stats['too_long'] += 1
+            elif args.min_duration > 0 and d is not None and d < args.min_duration:
+                stats['too_short'] += 1
+            else:
+                passed.append(line)
+        return passed
+
+    # With --num_samples the rows are shuffled first and checked chunk by chunk until enough usable rows are found,
+    # so only a few thousand files are ever opened. Checking every file of a large dataset first (what used to
+    # happen) takes hours when the audio is stored in the JSONL as base64.
+    if args.num_samples > 0:
+        random.Random(args.seed).shuffle(all_rows)
+    chunk = max(args.num_samples, 1000) if args.num_samples > 0 else 5000
+    total_lines = []
+    for first in range(0, len(all_rows), chunk):
+        total_lines.extend(filter_rows(all_rows[first:first + chunk]))
+        print(f"  checked {min(first + chunk, len(all_rows))}/{len(all_rows)} rows, {len(total_lines)} usable",
+              flush=True)
+        if args.num_samples > 0 and len(total_lines) >= args.num_samples:
+            break
+    checked = min(first + chunk, len(all_rows)) if all_rows else 0
+    del all_rows
+    if args.num_samples > 0:
+        if len(total_lines) < args.num_samples:
+            print(f"Warning: only {len(total_lines)} usable rows exist, fewer than --num_samples {args.num_samples}")
+        total_lines = total_lines[:args.num_samples]
+        print(f"--num_samples: using a random subset of {len(total_lines)} rows")
+
+    if args.normalize_text:
+        print(f"Text normalization changed {stats['text_changed']} of {checked} checked row(s)")
+    if long_rows:
+        long_path = args.output_jsonl + ".long_text.txt"
+        with open(long_path, 'w', encoding='utf-8') as f:
+            for line in long_rows:
+                f.write(f"{len(line['text'])}\t{short(line['audio'])}\t{line['text'][:100]!r}\n")
+        print(f"Dropped {len(long_rows)} row(s) with more than {args.max_text_chars} characters of text "
+              f"(listed in {long_path}); longest: {max(len(r['text']) for r in long_rows)} chars")
     if bad_audio:
         bad_path = args.output_jsonl + ".bad_audio.txt"
         with open(bad_path, 'w') as f:
             f.write("\n".join(bad_audio) + "\n")
-        print(f"Skipping {len(bad_audio)} row(s) with unreadable audio (listed in {bad_path}); "
-              f"first: {bad_audio[0]}")
-        total_lines = [line for line, ok in zip(total_lines, readable) if ok]
-
-    if args.normalize_text:
-        changed = 0
-        for line in total_lines:
-            clean = normalize_text(line['text'])
-            changed += clean != line['text']
-            line['text'] = clean
-        print(f"Text normalization changed {changed} of {len(total_lines)} row(s)")
-
-    if args.max_text_chars > 0:
-        long_rows =[line for line in total_lines if len(line['text']) > args.max_text_chars]
-        if long_rows:
-            long_path = args.output_jsonl + ".long_text.txt"
-            with open(long_path, 'w', encoding='utf-8') as f:
-                for line in long_rows:
-                    f.write(f"{len(line['text'])}\t{short(line['audio'])}\t{line['text'][:100]!r}\n")
-            print(f"Dropping {len(long_rows)} row(s) with more than {args.max_text_chars} characters of text "
-                  f"(listed in {long_path}); longest: {max(len(r['text']) for r in long_rows)} chars")
-            total_lines = [line for line in total_lines if len(line['text']) <= args.max_text_chars]
-
+        print(f"Dropped {len(bad_audio)} row(s) with unreadable audio (listed in {bad_path}); first: {bad_audio[0]}")
     if args.max_duration > 0 or args.min_duration > 0:
-        with ThreadPoolExecutor(args.num_threads) as pool:
-            durations = list(pool.map(audio_duration, [line['audio'] for line in total_lines]))
-        kept = []
-        for line, d in zip(total_lines, durations):
-            too_long = args.max_duration > 0 and d is not None and d > args.max_duration
-            too_short = args.min_duration > 0 and d is not None and d < args.min_duration
-            if not (too_long or too_short):
-                kept.append(line)
-        print(f"Duration filter (min {args.min_duration}s, max {args.max_duration}s): kept {len(kept)} of "
-              f"{len(total_lines)} rows, dropped {len(total_lines) - len(kept)}")
-        total_lines = kept
-
-    if args.num_samples > 0 and len(total_lines) > args.num_samples:
-        total_lines = random.Random(args.seed).sample(total_lines, args.num_samples)
-        print(f"--num_samples: using a random subset of {len(total_lines)} rows")
+        print(f"Duration filter (min {args.min_duration}s, max {args.max_duration}s): dropped "
+              f"{stats['too_long']} too long, {stats['too_short']} too short")
 
     # No audio is resampled or written here: the tokenizer resamples `audio` in memory when encoding, and
     # dataset.py resamples `ref_audio` to 24 kHz in memory when it is loaded for training.
