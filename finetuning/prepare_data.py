@@ -18,9 +18,12 @@ import argparse
 import base64
 import io
 import json
+import multiprocessing as mp
 import os
 import random
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import librosa
 import soundfile as sf
@@ -123,9 +126,71 @@ def split_rows(rows, test_ratio, seed):
     return train, test
 
 
+def encode_audios(tokenizer, audios, args):
+    if args.trim_silence or args.normalize_loudness:
+        waves = [load_audio(a, args) for a in audios]
+        return tokenizer.encode(waves, sr=24000)
+    return tokenizer.encode(audios)
+
+
+def encode_batch(tokenizer, batch_lines, args, tag):
+    """Encode a batch; if it fails, retry file by file and skip only the files that fail."""
+    try:
+        enc_res = encode_audios(tokenizer, [line['audio'] for line in batch_lines], args)
+        results = list(zip(enc_res.audio_codes, batch_lines))
+    except Exception as e:
+        print(f"{tag} Batch encode failed ({type(e).__name__}); retrying file by file", flush=True)
+        results = []
+        for line in batch_lines:
+            try:
+                results.append((encode_audios(tokenizer, [line['audio']], args).audio_codes[0], line))
+            except Exception as e2:
+                print(f"{tag} Skipping {short(line['audio'])}: {type(e2).__name__}: {e2}", flush=True)
+    encoded = []
+    for code, line in results:
+        line['audio_codes'] = code.cpu().tolist()
+        del line['audio']  # training only needs the codes; keeps the output small
+        encoded.append(line)
+    return encoded
+
+
+def encode_worker(rank, device, rows, part_path, args):
+    """Load the tokenizer on `device`, encode `rows` (a list, or the path of a shard JSONL) and write `part_path`."""
+    tag = f"[worker {rank} / {device}]"
+    if isinstance(rows, str):
+        with open(rows, encoding='utf-8') as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(args.tokenizer_model_path, device_map=device)
+    print(f"{tag} tokenizer loaded, {len(rows)} rows to encode", flush=True)
+    start = time.time()
+    with open(part_path, 'w', encoding='utf-8') as out:
+        for number, first in enumerate(range(0, len(rows), args.batch_size)):
+            for line in encode_batch(tokenizer, rows[first:first + args.batch_size], args, tag):
+                out.write(json.dumps(line, ensure_ascii=False) + '\n')
+            out.flush()
+            done = min(first + args.batch_size, len(rows))
+            if number % 10 == 0 or done == len(rows):
+                print(f"{tag} {done}/{len(rows)} rows ({time.time() - start:.0f}s)", flush=True)
+
+
+def write_jsonl(rows, path):
+    with open(path, 'w', encoding='utf-8') as f:
+        for line in rows:
+            f.write(json.dumps(line, ensure_ascii=False) + '\n')
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Encode on this single device (e.g. cuda:1 or cpu). Default: use --gpus")
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated GPU ids to encode on, one worker per GPU (default: all visible GPUs)")
+    parser.add_argument("--procs_per_gpu", type=int, default=1,
+                        help="Workers (tokenizer copies) per GPU; 2-3 can raise throughput when batches are small "
+                             "or the CPU-side loading (--trim_silence / --normalize_loudness) is the bottleneck")
+    parser.add_argument("--batch_size", type=int, default=BATCH_INFER_NUM, help="Clips per encode call, per worker")
+    parser.add_argument("--num_threads", type=int, default=min(8, os.cpu_count() or 1),
+                        help="Threads for the readability and duration checks that run before encoding")
     parser.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
@@ -169,25 +234,35 @@ def main():
     parser.add_argument("--min_duration", type=float, default=0.0,
                         help="Drop rows whose target audio is shorter than this many seconds (0 = no limit)")
     parser.add_argument("--log_file", type=str, default=None,
-                        help="Everything printed is also written here (default: <output_jsonl>.log)")
+                        help="Everything printed is also written here (default: <output_jsonl>.log). Worker "
+                             "progress lines go to the console only.")
     args = parser.parse_args()
     setup_logging(args.log_file or args.output_jsonl + ".log", args)
     if not 0.0 <= args.test_ratio < 1.0:
         parser.error("--test_ratio must be in [0, 1)")
+    if args.device and args.gpus:
+        parser.error("use either --device or --gpus, not both")
     if args.test_jsonl is None:
         stem, ext = os.path.splitext(args.output_jsonl)
         args.test_jsonl = f"{stem}_test{ext or '.jsonl'}"
 
-    tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
-        args.tokenizer_model_path,
-        device_map=args.device,
-    )
+    if args.device:
+        devices = [args.device]
+    else:
+        import torch
 
-    total_lines = open(args.input_jsonl).readlines()
-    total_lines = [json.loads(line.strip()) for line in total_lines]
+        gpus = [int(g) for g in args.gpus.split(",")] if args.gpus else list(range(torch.cuda.device_count()))
+        if not gpus:
+            raise SystemExit("No GPU available; pass --device cpu to encode on the CPU")
+        devices = [f"cuda:{g}" for g in gpus for _ in range(args.procs_per_gpu)]
+    print(f"Encoding workers: {devices}")
+
+    with open(args.input_jsonl, encoding='utf-8') as f:
+        total_lines = [json.loads(line) for line in f if line.strip()]
 
     # Drop rows whose audio cannot be read: one corrupt file would otherwise abort the whole encoding run.
-    readable = [audio_is_readable(line['audio']) for line in total_lines]
+    with ThreadPoolExecutor(args.num_threads) as pool:
+        readable = list(pool.map(audio_is_readable, [line['audio'] for line in total_lines]))
     bad_audio = [short(line['audio']) for line, ok in zip(total_lines, readable) if not ok]
     if bad_audio:
         bad_path = args.output_jsonl + ".bad_audio.txt"
@@ -217,9 +292,10 @@ def main():
             total_lines = [line for line in total_lines if len(line['text']) <= args.max_text_chars]
 
     if args.max_duration > 0 or args.min_duration > 0:
+        with ThreadPoolExecutor(args.num_threads) as pool:
+            durations = list(pool.map(audio_duration, [line['audio'] for line in total_lines]))
         kept = []
-        for line in total_lines:
-            d = audio_duration(line['audio'])
+        for line, d in zip(total_lines, durations):
             too_long = args.max_duration > 0 and d is not None and d > args.max_duration
             too_short = args.min_duration > 0 and d is not None and d < args.min_duration
             if not (too_long or too_short):
@@ -235,60 +311,67 @@ def main():
     # No audio is resampled or written here: the tokenizer resamples `audio` in memory when encoding, and
     # dataset.py resamples `ref_audio` to 24 kHz in memory when it is loaded for training.
 
-    def encode_audios(audios):
-        if args.trim_silence or args.normalize_loudness:
-            waves = [load_audio(a, args) for a in audios]
-            return tokenizer_12hz.encode(waves, sr=24000)
-        return tokenizer_12hz.encode(audios)
-
-    def encode_batch(batch_lines):
-        """Encode a batch; if it fails, retry file by file and skip only the files that fail."""
-        try:
-            enc_res = encode_audios([line['audio'] for line in batch_lines])
-            results = list(zip(enc_res.audio_codes, batch_lines))
-        except Exception as e:
-            print(f"Batch encode failed ({type(e).__name__}); retrying file by file")
-            results = []
-            for line in batch_lines:
-                try:
-                    results.append((encode_audios([line['audio']]).audio_codes[0], line))
-                except Exception as e2:
-                    print(f"Skipping {short(line['audio'])}: {type(e2).__name__}: {e2}")
-        encoded = []
-        for code, line in results:
-            line['audio_codes'] = code.cpu().tolist()
-            del line['audio']  # training only needs the codes; keeps the output small
-            encoded.append(line)
-        return encoded
-
-    def encode_rows(rows):
-        encoded = []
-        batch_lines = []
-        for line in rows:
-            batch_lines.append(line)
-            if len(batch_lines) >= BATCH_INFER_NUM:
-                encoded.extend(encode_batch(batch_lines))
-                batch_lines = []
-        if batch_lines:
-            encoded.extend(encode_batch(batch_lines))
-        return encoded
-
-    def write_jsonl(rows, path):
-        with open(path, 'w') as f:
-            for line in rows:
-                f.writelines(json.dumps(line, ensure_ascii=False) + '\n')
-
     if args.test_ratio > 0:
         train_rows, test_rows = split_rows(total_lines, args.test_ratio, args.seed)
     else:
         train_rows, test_rows = total_lines, []
     print(f"Split: {len(train_rows)} train rows, {len(test_rows)} test rows")
 
-    write_jsonl(encode_rows(train_rows), args.output_jsonl)
-    print(f"Wrote {args.output_jsonl}")
-    if test_rows:
-        write_jsonl(encode_rows(test_rows), args.test_jsonl)
-        print(f"Wrote {args.test_jsonl}")
+    # Train and test rows are encoded together (the tokenizer is loaded once per worker) and told apart again by
+    # `_split`; `_i` is the row's position, which restores the original order after the workers' parts are merged.
+    for name, rows in (("train", train_rows), ("test", test_rows)):
+        for i, row in enumerate(rows):
+            row['_split'], row['_i'] = name, i
+    todo = train_rows + test_rows
+    if not todo:
+        raise SystemExit("No rows left to encode after the filters")
+
+    n_workers = min(len(devices), len(todo))
+    shards = [todo[k::n_workers] for k in range(n_workers)]  # interleaved: every worker gets the same mix of clips
+    part_paths = [f"{args.output_jsonl}.part{rank}.jsonl" for rank in range(n_workers)]
+    shard_paths = []
+    crashed = []
+    if n_workers == 1:
+        encode_worker(0, devices[0], shards[0], part_paths[0], args)
+    else:
+        for rank, shard in enumerate(shards):  # each worker reads its own file instead of receiving a huge pickle
+            path = f"{args.output_jsonl}.shard{rank}.jsonl"
+            write_jsonl(shard, path)
+            shard_paths.append(path)
+        ctx = mp.get_context("spawn")
+        procs = [ctx.Process(target=encode_worker, args=(rank, devices[rank], shard_paths[rank], part_paths[rank], args))
+                 for rank in range(n_workers)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+        crashed = [rank for rank, p in enumerate(procs) if p.exitcode != 0]
+        if crashed:
+            print(f"Worker(s) {crashed} exited with an error; the rows they had not finished are missing. "
+                  f"Their part files are kept: {[part_paths[r] for r in crashed]}")
+
+    encoded = {"train": [], "test": []}
+    for path in part_paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                row = json.loads(line)
+                encoded[row.pop('_split')].append(row)
+    for name, path, expected in (("train", args.output_jsonl, len(train_rows)),
+                                 ("test", args.test_jsonl, len(test_rows))):
+        rows = sorted(encoded[name], key=lambda r: r['_i'])
+        for row in rows:
+            del row['_i']
+        if not rows and not expected:
+            continue
+        write_jsonl(rows, path)
+        print(f"Wrote {path}: {len(rows)} of {expected} rows"
+              + ("" if len(rows) == expected else f" ({expected - len(rows)} failed to encode)"))
+    for path in shard_paths + [p for rank, p in enumerate(part_paths) if rank not in crashed]:
+        if os.path.exists(path):
+            os.remove(path)
+
 
 if __name__ == "__main__":
     main()
