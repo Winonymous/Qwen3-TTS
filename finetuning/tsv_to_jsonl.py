@@ -9,6 +9,7 @@ Example:
 """
 import argparse
 import csv
+import difflib
 import json
 import os
 import random
@@ -80,24 +81,53 @@ def main():
     args = parser.parse_args()
     setup_logging(args.log_file or args.output_jsonl + ".log", args)
 
-    with open(args.input_tsv, newline="", encoding="utf-8") as f:
+    # utf-8-sig: a byte-order mark (written by Excel and by pandas with that encoding) would otherwise be glued to
+    # the first column name, so that column looks "missing".
+    with open(args.input_tsv, newline="", encoding="utf-8-sig") as f:
+        header = f.readline()
+        f.seek(0)
         reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
+        if reader.fieldnames:
+            reader.fieldnames = [c.strip() for c in reader.fieldnames]
         columns = reader.fieldnames or []
+        print(f"Columns in {args.input_tsv}: {columns}")
         missing = [c for c in (args.audio_column, args.text_column, args.speaker_column, args.language_column)
                    if c is not None and c not in columns]
         if missing:
-            parser.error(f"column(s) {missing} not found in {args.input_tsv} (columns: {columns})")
+            hints = []
+            if len(columns) == 1 and ("," in header or ";" in header):
+                hints.append("the file has a single column, so it is probably comma- or semicolon-separated, not "
+                             "tab-separated (this script reads tabs)")
+            for c in missing:
+                close = difflib.get_close_matches(c, columns, n=3, cutoff=0.5)
+                if close:
+                    hints.append(f"{c!r}: did you mean {close}?")
+            parser.error(f"column(s) {missing} not found in {args.input_tsv}. Columns: {columns}. "
+                         + " ".join(hints) + " Set the name with --audio_column / --text_column / "
+                         "--speaker_column / --language_column.")
         has_ref_column = args.ref_audio_column in columns
 
+        def cell(row, column):
+            """A cell as stripped text; '' if the row is too short to have that column (the reader gives None)."""
+            return (row.get(column) or "").strip()
+
         rows, skipped, too_long, normalized = [], 0, [], 0
+        malformed = []  # (line number, fields found) for rows that do not have exactly one value per column
         for row in reader:
-            audio = row[args.audio_column].strip()
-            text = row[args.text_column].strip()
+            if None in row or any(v is None for v in row.values()):
+                # Too few fields (a missing tab, or a text with a line break in it) or too many (a tab inside the
+                # text). The text column is the usual victim, so the row is dropped rather than guessed at.
+                found = sum(v is not None for k, v in row.items() if k is not None) + len(row.get(None) or [])
+                malformed.append((reader.line_num, found))
+                skipped += 1
+                continue
+            audio = cell(row, args.audio_column)
+            text = cell(row, args.text_column)
             if args.normalize_text:
                 clean = normalize_text(text)
                 normalized += clean != text
                 text = clean
-            ref_audio = args.ref_path or (row[args.ref_audio_column].strip() if has_ref_column else "")
+            ref_audio = args.ref_path or (cell(row, args.ref_audio_column) if has_ref_column else "")
             if not audio or not text or (args.check_audio and not os.path.isfile(audio)):
                 skipped += 1
                 continue
@@ -106,10 +136,10 @@ def main():
                 skipped += 1
                 continue
             item = {"audio": audio, "text": text, "ref_audio": ref_audio}
-            speaker = (row[args.speaker_column].strip() if args.speaker_column else "") or args.speaker
+            speaker = (cell(row, args.speaker_column) if args.speaker_column else "") or args.speaker
             if speaker:
                 item["speaker"] = speaker
-            language = (row[args.language_column].strip() if args.language_column else "") or args.language
+            language = (cell(row, args.language_column) if args.language_column else "") or args.language
             if language:
                 item["language"] = language
             rows.append(item)
@@ -136,6 +166,9 @@ def main():
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    if malformed:
+        print(f"Skipped {len(malformed)} row(s) that do not have {len(columns)} tab-separated fields; first few "
+              f"(file line, fields found): {malformed[:5]}")
     if too_long:
         print(f"Skipped {len(too_long)} row(s) with more than {args.max_text_chars} characters of text; "
               f"longest: {max(n for _, n in too_long)} chars. First few: "
