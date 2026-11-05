@@ -22,6 +22,7 @@ import shutil
 import traceback
 from collections import Counter
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -339,9 +340,17 @@ def train():
     accelerator.print(f"Model weights dtype: {next(qwen3tts.model.parameters()).dtype}")
 
     def read_jsonl(path):
-        # line by line: readlines() would hold the whole file as text next to the parsed rows, in every process
+        # Line by line: readlines() would hold the whole file as text next to the parsed rows, in every process.
+        # The codes become int16 arrays: as Python lists of ints they take about 7 times more memory than the JSON
+        # text, in each of the processes (hundreds of thousands of rows x 16 codes per frame).
+        rows = []
         with open(path, encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
+            for line in f:
+                if line.strip():
+                    row = json.loads(line)
+                    row["audio_codes"] = np.asarray(row["audio_codes"], dtype=np.int16)
+                    rows.append(row)
+        return rows
 
     train_data = read_jsonl(args.train_jsonl)
     val_data = read_jsonl(args.val_jsonl) if args.val_jsonl else []
