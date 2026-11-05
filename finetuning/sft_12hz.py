@@ -23,8 +23,12 @@ import traceback
 from collections import Counter
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from datetime import timedelta
+
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from dataset import TTSDataset
 from huggingface_hub import snapshot_download
 from logging_utils import setup_logging
@@ -165,6 +169,23 @@ def compute_losses(model, batch, per_sample=False):
     return loss, talker_loss, sub_talker_loss, speaker_embedding, (talker_ps, sub_ps)
 
 
+class LossModule(nn.Module):
+    """The model together with its loss, so that one training step is one `forward` call.
+
+    With several GPUs accelerate wraps the model in DistributedDataParallel, which only synchronizes gradients when
+    the computation goes through its `forward`. compute_losses uses the sub-modules (talker, speaker_encoder)
+    directly, so it is called from here instead: `model(batch)` runs it inside DDP's forward. The wrapped Qwen3-TTS
+    model is `self.inner`; its state dict (and so the checkpoint) is unchanged.
+    """
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, batch, per_sample=False):
+        return compute_losses(self.inner, batch, per_sample=per_sample)
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
@@ -181,6 +202,9 @@ def train():
                              "(bf16 autocast for compute) and needs more memory.")
     parser.add_argument("--warmup_steps", type=int, default=0,
                         help="Linear learning-rate warmup, in optimizer steps")
+    parser.add_argument("--grad_accum", type=int, default=4,
+                        help="Batches whose gradients are added up before each optimizer step. The effective batch "
+                             "size is batch_size x number of GPUs x grad_accum.")
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Stop after this many optimizer steps and save a checkpoint (0 = train all epochs)")
     parser.add_argument("--save_steps", type=int, default=0,
@@ -265,7 +289,16 @@ def train():
     args = parser.parse_args()
     setup_logging(args.log_file or os.path.join(args.output_model_path, "train.log"), args)
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.grad_accum, mixed_precision="bf16",
+        # some parameters get no gradient (the speaker encoder's output is detached), which DDP must be told about
+        # a long timeout: the other processes wait while the main one saves checkpoints and generates samples
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True),
+                         InitProcessGroupKwargs(timeout=timedelta(hours=3))],
+    )
+    accelerator.print(f"Processes: {accelerator.num_processes}, batch size per GPU {args.batch_size}, "
+                      f"grad_accum {args.grad_accum} -> effective batch "
+                      f"{args.batch_size * accelerator.num_processes * args.grad_accum}")
 
     wandb_run = None
     if args.wandb_project and accelerator.is_main_process:
@@ -412,21 +445,33 @@ def train():
         )
         accelerator.print(f"Validation: {len(val_data)} samples from {args.val_jsonl}")
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    loss_model = LossModule(qwen3tts.model)
+    optimizer = AdamW(loss_model.parameters(), lr=args.lr, weight_decay=0.01)
 
     if val_dataloader is not None:
         model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-            qwen3tts.model, optimizer, train_dataloader, val_dataloader
+            loss_model, optimizer, train_dataloader, val_dataloader
         )
     else:
         model, optimizer, train_dataloader = accelerator.prepare(
-            qwen3tts.model, optimizer, train_dataloader
+            loss_model, optimizer, train_dataloader
         )
 
     # Running mean of each speaker's encoder embedding over all training batches; it becomes that speaker's row.
     speaker_sum, speaker_count = {}, {}
 
     def save_checkpoint(name):
+        # Every process runs this: each has only seen its own share of the batches, so the speaker embedding sums
+        # are added up over all of them. Only the main process writes the files.
+        dim = accelerator.unwrap_model(model).inner.talker.model.codec_embedding.weight.shape[1]
+        sums = torch.zeros(len(speakers), dim, device=accelerator.device)
+        counts = torch.zeros(len(speakers), device=accelerator.device)
+        for k, speaker in enumerate(speakers):
+            if speaker_count.get(speaker, 0) > 0:
+                sums[k] = speaker_sum[speaker]
+                counts[k] = speaker_count[speaker]
+        sums = accelerator.reduce(sums, reduction="sum")
+        counts = accelerator.reduce(counts, reduction="sum")
         if not accelerator.is_main_process:
             return
         output_dir = os.path.join(args.output_model_path, name)
@@ -439,7 +484,7 @@ def train():
         config_dict["tts_model_type"] = "custom_voice"
         talker_config = config_dict.get("talker_config", {})
         # only speakers that have been seen in training so far have a meaningful embedding
-        trained = [name for name in speakers if speaker_count.get(name, 0) > 0]
+        trained = [speaker for k, speaker in enumerate(speakers) if counts[k] > 0]
         talker_config["spk_id"] = {name: speaker_ids[name] for name in trained}
         talker_config["spk_is_dialect"] = {name: False for name in trained}
         # keeps the checkpoint's own languages and adds the new ones
@@ -449,7 +494,7 @@ def train():
         with open(output_config_file, 'w', encoding='utf-8') as f:
             json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model = accelerator.unwrap_model(model).inner
         # checkpoints are stored in bf16 like the Base model, whatever dtype was used for training
         state_dict = {
             k: (v.detach().to("cpu", torch.bfloat16) if v.is_floating_point() else v.detach().to("cpu"))
@@ -462,9 +507,10 @@ def train():
             del state_dict[k]
 
         weight = state_dict['talker.model.codec_embedding.weight']
-        for name in trained:
-            mean_embedding = speaker_sum[name] / speaker_count[name]
-            weight[speaker_ids[name]] = mean_embedding.detach().to(weight.device).to(weight.dtype)
+        for speaker in trained:
+            k = speakers.index(speaker)
+            mean_embedding = sums[k] / counts[k]
+            weight[speaker_ids[speaker]] = mean_embedding.detach().to(weight.device).to(weight.dtype)
         save_path = os.path.join(output_dir, "model.safetensors")
         save_file(state_dict, save_path)
         accelerator.print(f"Saved {output_dir}")
@@ -626,8 +672,8 @@ def train():
                 if i % 50 == 0:
                     accelerator.print(f"  validation batch {i}/{len(val_dataloader)}")
                 with autocast_ctx():
-                    loss, talker_loss, sub_talker_loss, _, (talker_ps, sub_ps) = compute_losses(
-                        model, val_batch, per_sample=True)
+                    loss, talker_loss, sub_talker_loss, _, (talker_ps, sub_ps) = model(
+                        val_batch, per_sample=True)
                 n = val_batch['input_ids'].shape[0]
                 sums += torch.tensor(
                     [loss.item() * n, talker_loss.item() * n, sub_talker_loss.item() * n, n],
@@ -693,7 +739,7 @@ def train():
             with accelerator.accumulate(model):
 
                 with autocast_ctx():
-                    loss, talker_loss, sub_talker_loss, speaker_embedding = compute_losses(model, batch)
+                    loss, talker_loss, sub_talker_loss, speaker_embedding = model(batch)
                 for emb, idx in zip(speaker_embedding.float(), batch['speaker_idx'].tolist()):
                     name = speakers[idx]
                     speaker_sum[name] = speaker_sum.get(name, 0) + emb
