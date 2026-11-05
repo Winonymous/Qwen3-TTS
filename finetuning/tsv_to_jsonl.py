@@ -73,6 +73,10 @@ def main():
                              "transcripts, e.g. a repeated ASR hallucination.")
     parser.add_argument("--check_audio", action="store_true",
                         help="Skip rows whose audio file does not exist")
+    parser.add_argument("--quoting", choices=["none", "minimal"], default="none",
+                        help="How double quotes in the file are read. 'none' (default): a quote is ordinary text. "
+                             "'minimal': standard CSV quoting, needed when a text with tabs or line breaks was "
+                             "written in quotes (pandas does this); a stray unmatched quote then swallows rows")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Random subset of this many usable rows (skipped rows never count towards it)")
     parser.add_argument("--sample_seed", type=int, default=42)
@@ -81,12 +85,16 @@ def main():
     args = parser.parse_args()
     setup_logging(args.log_file or args.output_jsonl + ".log", args)
 
+    csv.field_size_limit(2 ** 31 - 1)  # the default 131072 characters per field is too small for a runaway transcript
     # utf-8-sig: a byte-order mark (written by Excel and by pandas with that encoding) would otherwise be glued to
     # the first column name, so that column looks "missing".
     with open(args.input_tsv, newline="", encoding="utf-8-sig") as f:
         header = f.readline()
         f.seek(0)
-        reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
+        # none: a quote character is ordinary text. minimal: the standard CSV rules (what pandas' to_csv writes), so
+        # a field in "quotes" may contain tabs and line breaks.
+        reader = csv.DictReader(f, delimiter="\t",
+                                quoting=csv.QUOTE_MINIMAL if args.quoting == "minimal" else csv.QUOTE_NONE)
         if reader.fieldnames:
             reader.fieldnames = [c.strip() for c in reader.fieldnames]
         columns = reader.fieldnames or []
@@ -118,7 +126,8 @@ def main():
                 # Too few fields (a missing tab, or a text with a line break in it) or too many (a tab inside the
                 # text). The text column is the usual victim, so the row is dropped rather than guessed at.
                 found = sum(v is not None for k, v in row.items() if k is not None) + len(row.get(None) or [])
-                malformed.append((reader.line_num, found))
+                malformed.append((reader.line_num, found, str({k: (v[:60] if isinstance(v, str) else v)
+                                                               for k, v in row.items()})[:300]))
                 skipped += 1
                 continue
             audio = cell(row, args.audio_column)
@@ -167,8 +176,13 @@ def main():
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     if malformed:
-        print(f"Skipped {len(malformed)} row(s) that do not have {len(columns)} tab-separated fields; first few "
-              f"(file line, fields found): {malformed[:5]}")
+        print(f"Skipped {len(malformed)} of {len(rows) + skipped} row(s) that do not have {len(columns)} "
+              f"tab-separated fields (--quoting {args.quoting}). First few:")
+        for line_num, found, content in malformed[:5]:
+            print(f"  file line {line_num}: {found} field(s): {content}")
+        if args.quoting == "none":
+            print("  If the transcripts contain line breaks or tabs and the file was written by pandas, those "
+                  "fields are in \"quotes\": rerun with --quoting minimal.")
     if too_long:
         print(f"Skipped {len(too_long)} row(s) with more than {args.max_text_chars} characters of text; "
               f"longest: {max(n for _, n in too_long)} chars. First few: "
