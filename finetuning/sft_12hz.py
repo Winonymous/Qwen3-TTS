@@ -258,6 +258,10 @@ def train():
                         help="Every N epochs (and at the end if --max_steps stops the run), load the saved "
                              "checkpoint like at inference and synthesize a few sentences into "
                              "<output_model_path>/samples/epoch-N/ (also logged to wandb). 0 = off.")
+    parser.add_argument("--sample_steps", type=int, default=0,
+                        help="The same, every N optimizer steps instead of every N epochs, into "
+                             "<output_model_path>/samples/step-N/. The checkpoint is the one saved by --save_steps, "
+                             "so this must be a multiple of --save_steps. 0 = off.")
     parser.add_argument("--sample_file", type=str, default=None,
                         help="Text file with one sentence per line to synthesize for every speaker. Default: the "
                              "first --num_sample_texts validation rows of each (speaker, language) group.")
@@ -287,6 +291,9 @@ def train():
                         help="Everything printed (losses, warnings, errors) is also written here "
                              "(default: <output_model_path>/train.log)")
     args = parser.parse_args()
+    if args.sample_steps > 0 and (args.save_steps <= 0 or args.sample_steps % args.save_steps):
+        parser.error("--sample_steps needs --save_steps and must be a multiple of it (samples are made from the "
+                     "checkpoint that --save_steps saved)")
     setup_logging(args.log_file or os.path.join(args.output_model_path, "train.log"), args)
 
     accelerator = Accelerator(
@@ -525,7 +532,7 @@ def train():
 
     # Sentences synthesized after each epoch: (speaker, language, text)
     sample_items = []
-    if args.sample_epochs > 0:
+    if args.sample_epochs > 0 or args.sample_steps > 0:
         if args.sample_file:
             with open(args.sample_file, encoding="utf-8") as f:
                 sample_texts = [line.strip() for line in f if line.strip()]
@@ -541,7 +548,8 @@ def train():
                 if len(per_group.setdefault(key, [])) < args.num_sample_texts:
                     per_group[key].append(d["text"])
             sample_items = [(sp, lang, t) for (sp, lang), texts in sorted(per_group.items()) for t in texts]
-        accelerator.print(f"Sampling every {args.sample_epochs} epoch(s): {len(sample_items)} sentence(s)")
+        accelerator.print(f"Sampling every {args.sample_epochs} epoch(s) / {args.sample_steps} step(s): "
+                          f"{len(sample_items)} sentence(s)")
 
     def _generate_samples(ckpt_name, tag):
         import soundfile as sf
@@ -776,6 +784,9 @@ def train():
                 if args.save_steps > 0 and opt_step % args.save_steps == 0:
                     save_checkpoint(f"checkpoint-step-{opt_step}")
                     run_eval(f"opt step {opt_step}")
+                    if (args.sample_steps > 0 and opt_step % args.sample_steps == 0
+                            and not (args.max_steps > 0 and opt_step >= args.max_steps)):  # the last step samples below
+                        generate_samples(f"checkpoint-step-{opt_step}", f"step-{opt_step}")
                 if args.max_steps > 0 and opt_step >= args.max_steps:
                     done = True
 
