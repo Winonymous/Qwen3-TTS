@@ -328,8 +328,13 @@ def train():
     # bf16 here means pure-bf16 training (no fp32 master weights); fp32 means autocast mixed precision.
     accelerator.print(f"Model weights dtype: {next(qwen3tts.model.parameters()).dtype}")
 
-    train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
-    val_data = [json.loads(line) for line in open(args.val_jsonl).readlines()] if args.val_jsonl else []
+    def read_jsonl(path):
+        # line by line: readlines() would hold the whole file as text next to the parsed rows, in every process
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    train_data = read_jsonl(args.train_jsonl)
+    val_data = read_jsonl(args.val_jsonl) if args.val_jsonl else []
     if args.normalize_text:
         changed = 0
         for d in train_data + val_data:
