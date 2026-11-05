@@ -311,7 +311,10 @@ def train():
 
     def wandb_log(data, step):
         if wandb_run is not None:
-            wandb_run.log(data, step=step)
+            try:
+                wandb_run.log(data, step=step)
+            except Exception:  # a logging problem must not kill a long training run
+                traceback.print_exc()
 
     MODEL_PATH = args.init_model_path
     if not os.path.isdir(MODEL_PATH):
@@ -567,9 +570,10 @@ def train():
                         sf.write(os.path.join(out_dir, name + ".wav"), wav, sr)
                         manifest.write(f"{name}\t{text}\n")
                         if wandb_run is not None:
-                            audio_logs[f"samples/{name}"] = wandb.Audio(wav, sample_rate=sr, caption=text)
+                            audio_logs[f"samples/{tag}/{name}"] = wandb.Audio(wav, sample_rate=sr, caption=text)
             if audio_logs:
                 wandb_log(audio_logs, step=opt_step)
+                accelerator.print(f"Logged {len(audio_logs)} audio clip(s) of {tag} to wandb at step {opt_step}")
             accelerator.print(f"Wrote {len(sample_items)} sample(s) to {out_dir}")
         except Exception:  # a sampling problem must not kill a long training run
             traceback.print_exc()
@@ -633,10 +637,14 @@ def train():
                         fields = line.rstrip("\n").split("\t")
                         if len(fields) >= 7 and fields[3] == "ok":
                             wav, sr = sf.read(fields[5])
-                            audio_logs[f"samples/{fields[0]}_{fields[1]}_{fields[2]}"] = wandb.Audio(
+                            audio_logs[f"samples/{tag}/{fields[0]}_{fields[1]}_{fields[2]}"] = wandb.Audio(
                                 wav, sample_rate=sr, caption=f"{tag}: {fields[6]}")
                 if audio_logs:
                     wandb_log(audio_logs, step=opt_step)  # logged at the step when the job finished
+                    accelerator.print(f"Logged {len(audio_logs)} audio clip(s) of {tag} to wandb at step {opt_step}")
+                else:
+                    accelerator.print(f"No audio clip of {tag} to log: nothing with status ok in "
+                                      f"{os.path.join(out_dir, 'manifest.tsv')}")
             except Exception:
                 traceback.print_exc()
 
@@ -772,6 +780,8 @@ def train():
                     done = True
 
             if step % 10 == 0:
+                if pending_samples and accelerator.is_main_process:
+                    collect_samples()  # log background samples as soon as their job has finished
                 accelerator.print(
                     f"Epoch {epoch} | Step {step} | Opt step {opt_step} | Loss: {loss.item():.4f} "
                     f"(talker {talker_loss.item():.4f}, sub-talker {sub_talker_loss.item():.4f})"

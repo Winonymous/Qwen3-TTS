@@ -266,9 +266,10 @@ def main():
     print(f"Encoding workers: {devices}")
 
     print(f"Reading {args.input_jsonl} ...", flush=True)
+    read_start = time.time()
     with open(args.input_jsonl, encoding='utf-8') as f:
         all_rows = [json.loads(line) for line in f if line.strip()]
-    print(f"Read {len(all_rows)} rows", flush=True)
+    print(f"Read {len(all_rows)} rows in {time.time() - read_start:.1f}s", flush=True)
 
     stats = Counter()
     bad_audio, long_rows = [], []
@@ -306,15 +307,33 @@ def main():
     # happen) takes hours when the audio is stored in the JSONL as base64.
     if args.num_samples > 0:
         random.Random(args.seed).shuffle(all_rows)
-    chunk = max(args.num_samples, 1000) if args.num_samples > 0 else 5000
+    # The progress lines come at fixed intervals (every LOG_EVERY rows) whatever --num_samples is. The work itself is
+    # done in steps of at most LOG_EVERY rows; with --num_samples a step covers just the rows that are still needed,
+    # so a small sample does not check more files than it has to.
+    LOG_EVERY = 10000
     total_lines = []
-    for first in range(0, len(all_rows), chunk):
-        total_lines.extend(filter_rows(all_rows[first:first + chunk]))
-        print(f"  checked {min(first + chunk, len(all_rows))}/{len(all_rows)} rows, {len(total_lines)} usable",
-              flush=True)
-        if args.num_samples > 0 and len(total_lines) >= args.num_samples:
+    checked = 0
+    next_log = LOG_EVERY
+    check_start = last_log = time.time()
+    while checked < len(all_rows):
+        step = LOG_EVERY
+        if args.num_samples > 0:
+            step = min(LOG_EVERY, max(500, int((args.num_samples - len(total_lines)) * 1.05) + 1))
+        total_lines.extend(filter_rows(all_rows[checked:checked + step]))
+        checked = min(checked + step, len(all_rows))
+        finished = checked >= len(all_rows) or (args.num_samples > 0 and len(total_lines) >= args.num_samples)
+        if checked >= next_log or finished:
+            now = time.time()
+            elapsed = now - check_start
+            # time left: for the whole input, or (with --num_samples) until enough usable rows are found
+            progress = (len(total_lines) / args.num_samples) if args.num_samples > 0 else checked / len(all_rows)
+            eta = f", about {elapsed / progress - elapsed:.0f}s left" if 0 < progress < 1 else ""
+            print(f"  checked {checked}/{len(all_rows)} rows, {len(total_lines)} usable "
+                  f"({now - last_log:.1f}s since the last line, total {elapsed:.1f}s{eta})", flush=True)
+            last_log = now
+            next_log = (checked // LOG_EVERY + 1) * LOG_EVERY
+        if finished:
             break
-    checked = min(first + chunk, len(all_rows)) if all_rows else 0
     del all_rows
     if args.num_samples > 0:
         if len(total_lines) < args.num_samples:
