@@ -191,6 +191,9 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--output_model_path", type=str, default="output")
+    parser.add_argument("--speaker_encoder_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        help="Where the speaker encoder comes from when --init_model_path is a checkpoint of this "
+                             "script (those have none)")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -335,6 +338,18 @@ def train():
         dtype=torch.bfloat16 if args.dtype == "bfloat16" else torch.float32,
         attn_implementation="flash_attention_2",
     )
+    if getattr(qwen3tts.model, "speaker_encoder", None) is None:
+        # Checkpoints written by this script have no speaker encoder (it is only needed to build speaker embeddings
+        # from reference clips), so when continuing from one it is taken from the Base model. It is frozen anyway.
+        base_path = args.speaker_encoder_path
+        if not os.path.isdir(base_path):
+            base_path = snapshot_download(base_path)
+        accelerator.print(f"{MODEL_PATH} has no speaker encoder; loading it from {base_path}")
+        base = Qwen3TTSModel.from_pretrained(base_path, dtype=qwen3tts.model.dtype, attn_implementation="sdpa")
+        if getattr(base.model, "speaker_encoder", None) is None:
+            raise SystemExit(f"{base_path} has no speaker encoder either; pass a Base model as --speaker_encoder_path")
+        qwen3tts.model.speaker_encoder = base.model.speaker_encoder
+        del base
     config = AutoConfig.from_pretrained(MODEL_PATH)
     # bf16 here means pure-bf16 training (no fp32 master weights); fp32 means autocast mixed precision.
     accelerator.print(f"Model weights dtype: {next(qwen3tts.model.parameters()).dtype}")
@@ -509,8 +524,10 @@ def train():
         talker_config = config_dict.get("talker_config", {})
         # only speakers that have been seen in training so far have a meaningful embedding
         trained = [speaker for k, speaker in enumerate(speakers) if counts[k] > 0]
-        talker_config["spk_id"] = {name: speaker_ids[name] for name in trained}
-        talker_config["spk_is_dialect"] = {name: False for name in trained}
+        # speakers of the checkpoint this run started from stay (their embedding rows are in the weights)
+        old_ids = dict(existing_ids)
+        talker_config["spk_id"] = {**old_ids, **{name: speaker_ids[name] for name in trained}}
+        talker_config["spk_is_dialect"] = {name: False for name in talker_config["spk_id"]}
         # keeps the checkpoint's own languages and adds the new ones
         talker_config["codec_language_id"] = dict(config.talker_config.codec_language_id)
         config_dict["talker_config"] = talker_config
